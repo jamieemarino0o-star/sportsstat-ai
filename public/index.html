@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#0c0f12">
+  <meta name="description" content="SportsStat AI Predictor: live sports scores, transparent statistical trends and sportsbook odds analysis.">
+  <title>SportsStat AI Predictor | Analytics Workspace</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Crect width='40' height='40' rx='9' fill='%23c5f277'/%3E%3Cpath d='M9 26l7-10 6 6 9-13M25 9h6v6' fill='none' stroke='%230c0f12' stroke-width='3'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;450;500;550;600;650;700&family=Manrope:wght@400;500;600;650;700;750;800&display=swap" rel="stylesheet">
+  <script src="https://cdn.tailwindcss.com/3.4.17"></script>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js" defer></script>
+  <link rel="stylesheet" href="/css/styles.css">
+  <script type="module" src="/js/app.js"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main-content">Skip to content</a>
+  <div id="sidebar-overlay" class="sidebar-overlay" hidden></div>
+  <aside class="sidebar" id="sidebar" aria-label="Main navigation">
+    <a class="brand" href="/" aria-label="SportsStat AI Predictor home">
+      <span class="brand-mark"><i data-lucide="chart-no-axes-combined"></i></span>
+      <span><strong>SportsStat<span class="brand-dot">.</span></strong><small>AI PREDICTOR</small></span>
+    </a>
+    <div class="workspace-switch"><span class="workspace-icon"><i data-lucide="layers-2"></i></span><span>Analytics workspace<small>Personal workspace</small></span><span class="workspace-badge">01</span></div>
+    <div class="nav-label">WORKSPACE</div>
+    <nav class="nav-list">
+      <button class="nav-item active" data-nav="dashboard" aria-current="page"><i data-lucide="layout-dashboard"></i><span>Dashboard</span></button>
+      <button class="nav-item" data-nav="engine"><i data-lucide="scan-line"></i><span>AI Prediction Engine</span><span class="nav-tag">AI</span></button>
+      <button class="nav-item" data-nav="tracker"><i data-lucide="radio"></i><span>Live Match Tracker</span><span class="live-dot"></span></button>
+      <button class="nav-item" data-nav="bets"><i data-lucide="receipt-text"></i><span>Bet Tracker</span></button>
+      <button class="nav-item" data-nav="feeds"><i data-lucide="cable"></i><span>API Feeds Status</span></button>
+    </nav>
+    <div class="nav-label sports-label">LEAGUES</div>
+    <nav class="league-list" aria-label="Select league">
+      <button data-sport="nfl" class="league-item selected"><span class="league-symbol football-symbol">NFL</span><span>NFL</span><span class="league-selection"></span></button>
+      <button data-sport="nba" class="league-item"><span class="league-symbol basketball-symbol">NBA</span><span>NBA</span><span class="league-selection"></span></button>
+      <button data-sport="wnba" class="league-item"><span class="league-symbol wnba-symbol">WNBA</span><span>WNBA</span><span class="league-selection"></span></button>
+      <button data-sport="mlb" class="league-item"><span class="league-symbol baseball-symbol">MLB</span><span>MLB</span><span class="league-selection"></span></button>
+      <button data-sport="nhl" class="league-item"><span class="league-symbol hockey-symbol">NHL</span><span>NHL</span><span class="league-selection"></span></button>
+      <button data-sport="epl" class="league-item"><span class="league-symbol epl-symbol">EPL</span><span>Premier League</span><span class="league-selection"></span></button>
+    </nav>
+    <div class="sidebar-bottom">
+      <div class="feed-mini"><span class="live-dot" id="sidebar-feed-dot"></span><span id="sidebar-feed-label">Connecting to feeds</span><button class="icon-button" data-nav="feeds" aria-label="View feed status" title="View feed status"><i data-lucide="arrow-up-right"></i></button></div>
+      <button class="methodology-link" id="methodology-button"><i data-lucide="circle-help"></i>Model & methodology<i data-lucide="arrow-up-right"></i></button>
+      <div class="profile"><span class="avatar">GA</span><span><strong>Guest analyst</strong><small>Local workspace</small></span><span class="profile-local" title="Local session"><i data-lucide="monitor"></i></span></div>
+    </div>
+  </aside>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="breadcrumb"><button class="icon-button menu-button" id="menu-toggle" aria-label="Open navigation" aria-expanded="false"><i data-lucide="menu"></i></button><span>Workspace</span><i data-lucide="chevron-right"></i><strong id="breadcrumb-view">Dashboard</strong></div>
+      <div class="topbar-actions"><span class="connection-pill" id="connection-pill"><span class="live-dot"></span>Connecting</span><span class="topbar-divider"></span><button class="icon-button" id="refresh-button" title="Refresh data" aria-label="Refresh data"><i data-lucide="refresh-cw"></i></button><span class="avatar avatar-small">GA</span></div>
+    </header>
+    <main id="main-content" tabindex="-1">
+      <div class="page-heading"><div><div class="eyebrow" id="page-eyebrow">YOUR ANALYTICS WORKSPACE</div><h1 id="page-title">A clearer view of the game<span>.</span></h1><p id="page-subtitle">Live action. Statistical signals. An informed edge.</p></div><div class="heading-actions"><span class="date-label" id="today-label"></span><button class="button button-secondary" id="export-button"><i data-lucide="download"></i><span>Export signals</span></button></div></div>
+      <div class="workspace-toolbar"><div class="sport-tabs" role="group" aria-label="Sports"><button class="sport-tab active" data-sport="nfl">NFL</button><button class="sport-tab" data-sport="nba">NBA</button><button class="sport-tab" data-sport="wnba">WNBA</button><button class="sport-tab" data-sport="mlb">MLB</button><button class="sport-tab" data-sport="nhl">NHL</button><button class="sport-tab" data-sport="epl">EPL</button></div><div class="toolbar-right"><label class="auto-refresh"><span class="live-dot"></span>Auto-refresh<input id="auto-refresh" type="checkbox" checked aria-label="Auto-refresh every 30 seconds"><span class="toggle-track"></span></label><div class="mode-switch" role="group" aria-label="Data source"><button class="active" data-mode="live" aria-pressed="true">Live data</button><button data-mode="demo" aria-pressed="false">Demo</button></div></div></div>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <div id="view-content" aria-busy="true"><div class="loading-state"><span class="loading-spinner"></span><h2>Connecting to the game</h2><p>Retrieving the latest ESPN schedule.</p></div></div>
+      <footer class="page-footer"><span><span class="footer-mark">S</span>Built on data. Not on guarantees.</span><span>Statistical estimates, not financial advice.<span class="footer-age">18+</span></span></footer>
+    </main>
+  </div>
+  <dialog id="detail-dialog" aria-labelledby="dialog-title"><div class="dialog-heading"><h2 id="dialog-title">Model methodology</h2><button class="icon-button" id="dialog-close" title="Close" aria-label="Close dialog"><i data-lucide="x"></i></button></div><div id="dialog-content"></div></dialog>
+  <div class="toast" id="toast" role="status" hidden></div>
+  <noscript><div class="noscript">JavaScript is required for the live sports dashboard.</div></noscript>
+</body>
+</html>

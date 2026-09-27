@@ -1,0 +1,21 @@
+{
+  "name": "sportsstat-ai-predictor",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Live sports analytics with transparent statistical signals and sportsbook odds matching.",
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "dev": "node --env-file-if-exists=.env --watch server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check src/feeds.js && node --check public/js/app.js && node --check public/js/model.js && node --check public/js/demo.js && node --check public/js/markets.js && node --check public/js/bets.js && node --check public/js/research.js"
+  },
+  "dependencies": {
+    "express": "^5.2.1",
+    "express-rate-limit": "^8.7.0",
+    "helmet": "^8.3.0"
+  }
+}
