@@ -2,25 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SPORT_MARKETS, analyzeMarket, bestQuotes, marketQuotes, readPlayerStat, gameMarketValue, gradeValue } from '../public/js/markets.js';
 import { betMetrics, createSlip, settleSlip, suggestedResult } from '../public/js/bets.js';
-import { createDemo, createDemoMarkets } from '../public/js/demo.js';
 
 const game = { id: '1', sport: 'wnba', date: '2030-05-01', home: { id: '1', name: 'Las Vegas Aces', score: 90, firstHalfScore: 43 }, away: { id: '2', name: 'New York Liberty', score: 86, firstHalfScore: 40 } };
 const quote = { market: 'player_points', subject: 'A Player', direction: 'Over', line: 20, price: 1.9 };
 const observations = Array.from({ length: 10 }, (_, index) => ({ eventId: String(index), date: `2025-01-${String(index + 1).padStart(2, '0')}`, value: index < 6 ? 25 : index < 8 ? 19 : 20 }));
-
-test('all advertised demo markets have finite values, auditable samples and explicit fixture sources', () => {
-  for (const sport of Object.keys(SPORT_MARKETS)) {
-    const demo = createDemo(sport);
-    for (const market of SPORT_MARKETS[sport].filter((key) => key !== 'h2h')) {
-      const result = createDemoMarkets(demo.games[0], demo.history, market, 20);
-      assert.ok(result.signals.length > 0, `${sport}: ${market}`);
-      for (const signal of result.signals) {
-        assert.equal(signal.analysis.sample, 20);
-        assert.ok(signal.analysis.provenance.sources.every((entry) => Number.isFinite(entry.value) && entry.source.provider.includes('simulated')));
-      }
-    }
-  }
-});
 
 test('market analysis respects pushes, minimum samples, cutoff and weights', () => {
   const result = analyzeMarket([...observations, observations[0], { eventId: 'future', date: '2031-01-01', value: 30 }], quote);
@@ -65,7 +50,7 @@ test('spreads, half spreads, team totals, BTTS and missing values are distinct',
 
 test('ledger conserves bankroll and calculates win rate/ROI without active or void bets', () => {
   const signal = { game, quote, label: 'A Player over 20 points', analysis: analyzeMarket(observations, quote) };
-  const slip = createSlip(signal, 10, 2.5, 10000, 'demo');
+  const slip = createSlip(signal, 10, 2.5, 10000);
   assert.equal(slip.model.ev, (signal.analysis.probability * 2.5 + signal.analysis.pushProbability - 1) * 100);
   assert.notEqual(slip.model.ev, signal.analysis.ev);
   assert.deepEqual(slip.model.provenance, signal.analysis.provenance);
@@ -79,9 +64,9 @@ test('ledger conserves bankroll and calculates win rate/ROI without active or vo
   assert.equal(betMetrics([settleSlip(won, 'void')], 10000).availableCents, 10000);
   assert.equal(betMetrics([settleSlip(won, 'push')], 10000).winRate, null);
   assert.equal(betMetrics([settleSlip(won, 'active')], 10000).availableCents, 9000);
-  assert.throws(() => createSlip(signal, -1, 2, 10000, 'live'));
-  assert.throws(() => createSlip(signal, 101, 2, 10000, 'live'));
-  assert.throws(() => createSlip(signal, 10, 1, 10000, 'live'));
+  assert.throws(() => createSlip(signal, -1, 2, 10000));
+  assert.throws(() => createSlip(signal, 101, 2, 10000));
+  assert.throws(() => createSlip(signal, 10, 1, 10000));
   assert.equal(slip.model.provenance.sources.length, 10);
 });
 

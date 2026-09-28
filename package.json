@@ -10,8 +10,11 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
     "dev": "node --env-file-if-exists=.env --watch server.js",
-    "test": "node --test",
-    "check": "node --check server.js && node --check src/feeds.js && node --check public/js/app.js && node --check public/js/model.js && node --check public/js/demo.js && node --check public/js/markets.js && node --check public/js/bets.js && node --check public/js/research.js"
+    "backtest": "node --env-file-if-exists=.env src/backtest.js",
+    "optimize": "node --env-file-if-exists=.env src/optimize.js",
+    "audit": "node --env-file-if-exists=.env src/audit.js",
+    "test": "node --test tests/*.test.js",
+    "check": "node --check server.js && node --check src/feeds.js && node --check src/ledger.js && node --check src/backtest.js && node --check src/optimize.js && node --check src/audit.js && node --check public/js/app.js && node --check public/js/model.js && node --check public/js/quants.js && node --check public/js/markets.js && node --check public/js/bets.js && node --check public/js/research.js && node --check public/js/audit.js"
   },
   "dependencies": {
     "express": "^5.2.1",

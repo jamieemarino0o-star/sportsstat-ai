@@ -29,15 +29,73 @@ test('small samples do not produce a probability and ties count as half wins', (
   assert.equal(historicalTrend([{ ...history[0], away: { ...game.away, score: 110 } }], 'a').wins, 0.5);
 });
 
+test('exponential recency decay weights recent games more heavily than older ones', () => {
+  // 10 games, most recent 5 are losses and the oldest 5 are wins; frequency is 0.5 either way,
+  // but decay < 1 should pull the shrunk probability down since the losses are the recent evidence.
+  const mixed = history.map((entry, index) => ({ ...entry, home: { ...entry.home, score: index < 5 ? 120 : 90 }, away: { ...entry.away, score: 100 } }));
+  const flat = historicalTrend(mixed, 'a', '2026-09-20', 10, 1);
+  const decayed = historicalTrend(mixed, 'a', '2026-09-20', 10, 0.5);
+  assert.equal(flat.frequency, 0.5);
+  assert.ok(decayed.probability < flat.probability);
+  assert.equal(historicalTrend(mixed, 'a', '2026-09-20', 10, 0).decay, 1); // invalid decay falls back to equal weighting
+});
+
+test('the Bayesian prior shrinks toward a team\'s own longer-run baseline once enough older games exist', () => {
+  const recentLosses = history.map((entry, index) => ({ ...entry, id: `recent-${index}`, home: { ...entry.home, score: 90 }, away: { ...entry.away, score: 100 } }));
+  const olderWins = Array.from({ length: 10 }, (_, index) => ({ ...game, id: `older-${index}`, date: `2026-08-${String(index + 1).padStart(2, '0')}T20:00:00Z` }));
+  const withoutBaseline = historicalTrend(recentLosses, 'a', '2026-09-20');
+  const withBaseline = historicalTrend([...recentLosses, ...olderWins], 'a', '2026-09-20');
+  assert.equal(withoutBaseline.baselineMean, null);
+  assert.equal(withBaseline.baselineSample, 10);
+  assert.equal(withBaseline.baselineMean, 1);
+  assert.ok(withBaseline.probability > withoutBaseline.probability);
+});
+
+test('strength-of-schedule discounts wins over weak opponents and credits wins over strong opponents, using the record already on the schedule', () => {
+  const noRecord = historicalTrend(history, 'a', '2026-09-20');
+  assert.equal(noRecord.sos.averageOpponentWinPct, null);
+  assert.equal(noRecord.sos.adjustment, 0);
+  assert.equal(noRecord.probability, noRecord.rawProbability);
+  const weakSchedule = history.map((entry) => ({ ...entry, away: { ...entry.away, record: '2-8' } }));
+  const strongSchedule = history.map((entry) => ({ ...entry, away: { ...entry.away, record: '8-2' } }));
+  const weak = historicalTrend(weakSchedule, 'a', '2026-09-20');
+  const strong = historicalTrend(strongSchedule, 'a', '2026-09-20');
+  assert.equal(weak.rawProbability, strong.rawProbability); // identical 10-0 raw record either way
+  assert.ok(weak.sos.averageOpponentWinPct < 0.5);
+  assert.ok(strong.sos.averageOpponentWinPct > 0.5);
+  assert.ok(weak.probability < weak.rawProbability); // padding stats vs. weak teams is discounted
+  assert.ok(strong.probability > strong.rawProbability); // beating strong teams is credited
+  assert.ok(weak.probability < strong.probability);
+  // Fewer than the minimum sample of parseable opponent records: no adjustment applied yet.
+  const sparse = history.map((entry, index) => ({ ...entry, away: { ...entry.away, record: index < 2 ? '2-8' : undefined } }));
+  assert.equal(historicalTrend(sparse, 'a', '2026-09-20').sos.averageOpponentWinPct, null);
+});
+
+test('sosWeight is an explorable parameter: it scales the adjustment magnitude and defaults to the historic 0.3 weight', () => {
+  const weakSchedule = history.map((entry) => ({ ...entry, away: { ...entry.away, record: '2-8' } }));
+  const zeroWeight = historicalTrend(weakSchedule, 'a', '2026-09-20', 10, 1, 0);
+  const halfWeight = historicalTrend(weakSchedule, 'a', '2026-09-20', 10, 1, 0.5);
+  const defaulted = historicalTrend(weakSchedule, 'a', '2026-09-20');
+  assert.equal(zeroWeight.sos.adjustment, 0); // a weight of 0 disables the SOS adjustment entirely
+  assert.equal(zeroWeight.probability, zeroWeight.rawProbability);
+  assert.ok(Math.abs(halfWeight.sos.adjustment) > Math.abs(defaulted.sos.adjustment)); // 0.5 > the 0.3 default
+  assert.equal(defaulted.sos.weight, 0.3);
+  assert.equal(zeroWeight.sos.weight, 0);
+  // Out-of-range weights fall back to the module default, exactly like an invalid decay does.
+  assert.equal(historicalTrend(weakSchedule, 'a', '2026-09-20', 10, 1, 2).sos.weight, 0.3);
+});
+
 test('provenance contains the exact weighted sample and source references', () => {
   const source = { provider: 'ESPN', url: 'https://site.api.espn.com/schedule', fetchedAt: '2026-09-20T00:00:00Z' };
   const samples = history.map((entry) => ({ ...entry, source }));
   const prediction = predictGame({ ...game, date: '2030-01-01', completed: false }, samples, samples, 20);
   assert.equal(prediction.home.observations.length, prediction.home.sample);
   assert.equal(prediction.provenance.window, 20);
+  assert.equal(prediction.provenance.sosWeight, 0.3);
+  assert.equal(predictGame({ ...game, date: '2030-01-01', completed: false }, samples, samples, 20, 0, 1, 0.5).provenance.sosWeight, 0.5);
   assert.equal(prediction.home.observations[0].source.url, source.url);
   assert.ok(Math.abs(prediction.home.observations.reduce((total, item) => total + item.weight, 0) - 1) < 1e-10);
-  assert.deepEqual(prediction.provenance.prior, { wins: 2, losses: 2 });
+  assert.deepEqual(prediction.provenance.prior, { strength: 4, homeBaseline: null, homeBaselineSample: 0, awayBaseline: null, awayBaselineSample: 0 });
   assert.equal(predictGame({ ...game, sport: 'epl', completed: false }, samples, samples).probability, null);
 });
 

@@ -31,6 +31,7 @@
       <button class="nav-item" data-nav="tracker"><i data-lucide="radio"></i><span>Live Match Tracker</span><span class="live-dot"></span></button>
       <button class="nav-item" data-nav="bets"><i data-lucide="receipt-text"></i><span>Bet Tracker</span></button>
       <button class="nav-item" data-nav="feeds"><i data-lucide="cable"></i><span>API Feeds Status</span></button>
+      <button class="nav-item" data-nav="audit"><i data-lucide="microscope"></i><span>Audit Lab</span></button>
     </nav>
     <div class="nav-label sports-label">LEAGUES</div>
     <nav class="league-list" aria-label="Select league">
@@ -54,7 +55,7 @@
     </header>
     <main id="main-content" tabindex="-1">
       <div class="page-heading"><div><div class="eyebrow" id="page-eyebrow">YOUR ANALYTICS WORKSPACE</div><h1 id="page-title">A clearer view of the game<span>.</span></h1><p id="page-subtitle">Live action. Statistical signals. An informed edge.</p></div><div class="heading-actions"><span class="date-label" id="today-label"></span><button class="button button-secondary" id="export-button"><i data-lucide="download"></i><span>Export signals</span></button></div></div>
-      <div class="workspace-toolbar"><div class="sport-tabs" role="group" aria-label="Sports"><button class="sport-tab active" data-sport="nfl">NFL</button><button class="sport-tab" data-sport="nba">NBA</button><button class="sport-tab" data-sport="wnba">WNBA</button><button class="sport-tab" data-sport="mlb">MLB</button><button class="sport-tab" data-sport="nhl">NHL</button><button class="sport-tab" data-sport="epl">EPL</button></div><div class="toolbar-right"><label class="auto-refresh"><span class="live-dot"></span>Auto-refresh<input id="auto-refresh" type="checkbox" checked aria-label="Auto-refresh every 30 seconds"><span class="toggle-track"></span></label><div class="mode-switch" role="group" aria-label="Data source"><button class="active" data-mode="live" aria-pressed="true">Live data</button><button data-mode="demo" aria-pressed="false">Demo</button></div></div></div>
+      <div class="workspace-toolbar"><div class="sport-tabs" role="group" aria-label="Sports"><button class="sport-tab active" data-sport="nfl">NFL</button><button class="sport-tab" data-sport="nba">NBA</button><button class="sport-tab" data-sport="wnba">WNBA</button><button class="sport-tab" data-sport="mlb">MLB</button><button class="sport-tab" data-sport="nhl">NHL</button><button class="sport-tab" data-sport="epl">EPL</button></div><div class="toolbar-right"><label class="auto-refresh"><span class="live-dot"></span>Auto-refresh<input id="auto-refresh" type="checkbox" checked aria-label="Auto-refresh every 30 seconds"><span class="toggle-track"></span></label></div></div>
       <div id="notice" class="notice" role="status" hidden></div>
       <div id="view-content" aria-busy="true"><div class="loading-state"><span class="loading-spinner"></span><h2>Connecting to the game</h2><p>Retrieving the latest ESPN schedule.</p></div></div>
       <footer class="page-footer"><span><span class="footer-mark">S</span>Built on data. Not on guarantees.</span><span>Statistical estimates, not financial advice.<span class="footer-age">18+</span></span></footer>

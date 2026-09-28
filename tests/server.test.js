@@ -4,26 +4,143 @@ import { createApp } from '../server.js';
 import { createFeeds } from '../src/feeds.js';
 
 test('proxy validates parameters and hides its implementation header', async (context) => {
-  const app = createApp({ status: () => ({ espn: { state: 'idle' } }), scoreboard: async () => ({ games: [] }) });
+  const app = createApp({ status: () => ({ espn: { state: 'idle' } }), scoreboard: async () => ({ games: [] }), injuries: async () => ({ teams: [] }) });
   const server = app.listen(0, '127.0.0.1');
   context.after(() => new Promise((resolve) => server.close(resolve)));
   await new Promise((resolve) => server.once('listening', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   assert.equal((await fetch(`${base}/api/scoreboard?sport=bad`)).status, 400);
+  assert.equal((await fetch(`${base}/api/injuries?sport=bad`)).status, 400);
   assert.equal((await fetch(`${base}/api/summary?sport=nfl&event=../../secret`)).status, 400);
   assert.equal((await fetch(`${base}/api/history?sport=nfl&team=1&season=no`)).status, 400);
   assert.equal((await fetch(`${base}/api/markets?sport=wnba&event=1&market=player_pass_yds`)).status, 400);
   assert.equal((await fetch(`${base}/api/markets?sport=wnba&event=1&market=player_points&window=100`)).status, 400);
+  assert.equal((await fetch(`${base}/api/odds/history?sport=nfl`)).status, 400);
+  assert.equal((await fetch(`${base}/api/predictions?sport=nfl`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ eventId: 'abc', homeProbability: 2 }) })).status, 400);
+  assert.equal((await fetch(`${base}/api/predictions/stats?sport=bad`)).status, 400);
+  // /api/optimized-params never requires a sport query param (it can report every sport at once),
+  // and reads best-effort from disk: with no generated file yet it degrades to an empty payload.
+  const optimizedParams = await (await fetch(`${base}/api/optimized-params`)).json();
+  assert.deepEqual(optimizedParams, { generatedAt: null, sports: {} });
+  const filtered = await (await fetch(`${base}/api/optimized-params?sport=nfl`)).json();
+  assert.deepEqual(filtered, { generatedAt: null, sport: null });
+  // /api/audit reads the real, append-only ledger file straight off disk (like /api/optimized-params
+  // above), so its exact numbers vary with live data -- only the response shape is asserted here.
+  const audit = await (await fetch(`${base}/api/audit`)).json();
+  assert.equal(typeof audit.sample, 'number');
+  assert.ok(Array.isArray(audit.insights) && audit.insights.length > 0);
+  assert.ok(Array.isArray(audit.history));
+  assert.ok(Array.isArray(audit.byRiskTier) && Array.isArray(audit.byOddsBracket) && Array.isArray(audit.bySport));
+  assert.equal(audit.sport, null);
+  const auditFiltered = await (await fetch(`${base}/api/audit?sport=nfl`)).json();
+  assert.equal(auditFiltered.sport, 'nfl');
+  assert.equal((await fetch(`${base}/api/audit?sport=bad`)).status, 200); // an invalid sport is silently ignored, not rejected, since this route spans every sport by default
   const response = await fetch(`${base}/api/scoreboard?sport=nfl`);
   assert.deepEqual(await response.json(), { games: [] });
+  const injuryResponse = await fetch(`${base}/api/injuries?sport=nfl`);
+  assert.deepEqual(await injuryResponse.json(), { teams: [] });
   assert.equal(response.headers.get('x-powered-by'), null);
   assert.ok(response.headers.get('content-security-policy'));
+});
+
+test('injury reports normalize team/player details and cache the league endpoint', async () => {
+  const urls = [];
+  const feeds = createFeeds({ fetcher: async (url) => {
+    urls.push(url);
+    return Response.json({ injuries: [
+      { id: 12, displayName: 'Kansas City Chiefs', injuries: [
+        { id: 44, athlete: { id: 900, displayName: 'Player One' }, status: 'Questionable', date: '2026-09-27T12:00Z', shortComment: 'Limited practice.' },
+        { athlete: { id: 900, displayName: 'Player Two' }, status: 'Out', longComment: 'Long report.' },
+        { id: 45, status: 'Out' },
+      ] },
+      { id: 33, displayName: 'Baltimore Ravens', injuries: [] },
+    ] });
+  } });
+  const [first, second] = await Promise.all([feeds.injuries('nfl'), feeds.injuries('nfl')]);
+  assert.deepEqual(second, first);
+  assert.equal(urls.length, 1);
+  assert.ok(urls[0].endsWith('/football/nfl/injuries'));
+  assert.deepEqual(first.teams, [
+    { teamId: '12', team: 'Kansas City Chiefs', injuries: [
+      { id: '44', athlete: 'Player One', status: 'Questionable', date: '2026-09-27T12:00Z', comment: 'Limited practice.' },
+      { id: '900', athlete: 'Player Two', status: 'Out', date: null, comment: 'Long report.' },
+    ] },
+    { teamId: '33', team: 'Baltimore Ravens', injuries: [] },
+  ]);
+  assert.equal(first.source.url, 'https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries');
+  assert.ok(first.fetchedAt);
 });
 
 test('unconfigured odds never return fabricated prices', async () => {
   const feeds = createFeeds({ oddsKey: '', fetcher: () => assert.fail('Should not fetch') });
   assert.deepEqual(await feeds.odds('nfl'), { configured: false, events: [], fetchedAt: null });
   assert.deepEqual((await feeds.markets('wnba', '1', 'player_threes')).signals, []);
+  assert.deepEqual(await feeds.lineHistory('nfl', '1'), { configured: false, eventId: null, snapshots: [] });
+});
+
+test('line movement history snapshots best moneyline prices per book and does not duplicate cached fetches', async () => {
+  const date = new Date(Date.now() + 86400000).toISOString();
+  const competitors = [
+    { homeAway: 'home', team: { id: '17', displayName: 'Kansas City Chiefs' }, score: '0' },
+    { homeAway: 'away', team: { id: '9', displayName: 'Buffalo Bills' }, score: '0' },
+  ];
+  const game = { id: '700', date, competitions: [{ competitors }], status: { type: { state: 'pre' } } };
+  const oddsEvent = { id: 'odds-event-1', sport_key: 'americanfootball_nfl', home_team: 'Kansas City Chiefs', away_team: 'Buffalo Bills', commence_time: date,
+    bookmakers: [
+      { key: 'draftkings', title: 'DraftKings', markets: [{ key: 'h2h', outcomes: [{ name: 'Kansas City Chiefs', price: 1.9 }, { name: 'Buffalo Bills', price: 2.05 }] }] },
+      { key: 'fanduel', title: 'FanDuel', markets: [{ key: 'h2h', outcomes: [{ name: 'Kansas City Chiefs', price: 1.95 }, { name: 'Buffalo Bills', price: 2.0 }] }] },
+    ] };
+  const feeds = createFeeds({ oddsKey: 'fixture-secret', fetcher: async (url) => {
+    const parsed = new URL(url);
+    if (parsed.hostname === 'api.the-odds-api.com') return Response.json([oddsEvent]);
+    if (parsed.pathname.endsWith('/scoreboard')) return Response.json({ events: [game], leagues: [{ season: { year: 2026 } }] });
+    assert.fail(`Unexpected fixture URL: ${parsed.pathname}`);
+  } });
+  const first = await feeds.lineHistory('nfl', '700');
+  assert.equal(first.configured, true);
+  assert.equal(first.eventId, 'odds-event-1');
+  assert.equal(first.snapshots.length, 1);
+  assert.equal(first.snapshots[0].home, 1.95);
+  assert.equal(first.snapshots[0].away, 2.05);
+  assert.deepEqual(first.snapshots[0].books.draftkings, { home: 1.9, away: 2.05 });
+  const second = await feeds.lineHistory('nfl', '700');
+  assert.equal(second.snapshots.length, 1);
+  assert.equal((await feeds.lineHistory('nfl', 'unknown-event')).eventId, null);
+});
+
+test('prediction ledger only accepts predictions for events currently on the scoreboard and reports pending/reconciled stats', async () => {
+  const competitors = [
+    { homeAway: 'home', team: { id: '17', displayName: 'Kansas City Chiefs' }, score: '0' },
+    { homeAway: 'away', team: { id: '9', displayName: 'Buffalo Bills' }, score: '0' },
+  ];
+  const game = { id: '500', date: new Date().toISOString(), competitions: [{ competitors }], status: { type: { state: 'pre' } } };
+  const feeds = createFeeds({ fetcher: async () => Response.json({ events: [game], leagues: [{ season: { year: 2026 } }] }) });
+  const rejected = await feeds.recordPrediction('nfl', { eventId: '999', homeProbability: 0.5 });
+  assert.equal(rejected.recorded, false);
+  const accepted = await feeds.recordPrediction('nfl', { eventId: '500', homeProbability: 0.62, selection: 'home', window: 10, sample: 12 });
+  assert.equal(accepted.recorded, true);
+  assert.equal(accepted.entry.homeTeam, 'Kansas City Chiefs');
+  assert.equal(accepted.entry.awayTeam, 'Buffalo Bills');
+  assert.equal(accepted.entry.resolved, false);
+  const stats = await feeds.predictionStats('nfl');
+  assert.equal(stats.pending, 1);
+  assert.equal(stats.sample, 0);
+  assert.equal(stats.biasFactor, 0);
+});
+
+test('scoreboard fetches automatically reconcile pending predictions once ESPN reports a game complete', async () => {
+  const calls = [];
+  const stubLedger = { record: () => null, reconcile: (sport, games) => { calls.push({ sport, games }); return []; }, stats: () => ({}) };
+  const game = { id: '501', date: new Date().toISOString(), competitions: [{ competitors: [
+    { homeAway: 'home', team: { id: '1', displayName: 'Home' }, score: '20' },
+    { homeAway: 'away', team: { id: '2', displayName: 'Away' }, score: '17' },
+  ] }], status: { type: { state: 'post', completed: true } } };
+  const feeds = createFeeds({ ledger: stubLedger, fetcher: async () => Response.json({ events: [game], leagues: [{ season: { year: 2026 } }] }) });
+  await feeds.scoreboard('nfl');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].sport, 'nfl');
+  assert.equal(calls[0].games[0].id, '501');
+  assert.equal(calls[0].games[0].completed, true);
 });
 
 test('WNBA/EPL feeds retain historical endpoint timestamps and normalized player identities', async () => {

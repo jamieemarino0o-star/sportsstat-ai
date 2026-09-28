@@ -1,5 +1,6 @@
 import { normalizeEvent } from '../public/js/model.js';
 import { MARKETS, analyzeMarket, bestQuotes, findOddsEvent, marketQuotes, readPlayerStat, gameMarketValue } from '../public/js/markets.js';
+import { createLedger } from './ledger.js';
 
 export const SPORTS = {
   nfl: { path: 'football/nfl', odds: 'americanfootball_nfl', name: 'NFL' },
@@ -10,7 +11,32 @@ export const SPORTS = {
   epl: { path: 'soccer/eng.1', odds: 'soccer_epl', name: 'EPL' },
 };
 
-export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KEY } = {}) {
+const BOOKS = ['draftkings', 'fanduel', 'betmgm'];
+const LINE_HISTORY_MAX_SNAPSHOTS = 200;
+const LINE_HISTORY_MAX_EVENTS = 500;
+const LINE_HISTORY_MAX_AGE = 3 * 24 * 60 * 60 * 1000;
+// The Odds API free tier grants a limited monthly credit pool. Polling every 3 minutes across six
+// sports would exhaust it in days, so odds requests (and the line-movement snapshots derived from
+// them) are shared off a single cache entry per sport and only refreshed this often by default.
+// Override with ODDS_POLL_INTERVAL_MS (milliseconds) if a paid plan allows tighter polling.
+const ODDS_TTL = Number(process.env.ODDS_POLL_INTERVAL_MS) > 0 ? Number(process.env.ODDS_POLL_INTERVAL_MS) : 30 * 60 * 1000;
+
+function snapshotMoneyline(event, time) {
+  const books = {};
+  for (const bookmaker of event.bookmakers || []) {
+    if (!BOOKS.includes(bookmaker.key)) continue;
+    const market = bookmaker.markets?.find((entry) => entry.key === 'h2h');
+    const home = market?.outcomes?.find((outcome) => outcome.name === event.home_team)?.price;
+    const away = market?.outcomes?.find((outcome) => outcome.name === event.away_team)?.price;
+    if (Number.isFinite(home) || Number.isFinite(away)) books[bookmaker.key] = { home: home ?? null, away: away ?? null };
+  }
+  if (!Object.keys(books).length) return null;
+  const homePrices = Object.values(books).map((entry) => entry.home).filter(Number.isFinite);
+  const awayPrices = Object.values(books).map((entry) => entry.away).filter(Number.isFinite);
+  return { time: new Date(time).toISOString(), home: homePrices.length ? Math.max(...homePrices) : null, away: awayPrices.length ? Math.max(...awayPrices) : null, books };
+}
+
+export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY, ledger = createLedger() } = {}) {
   const cache = new Map();
   const pending = new Map();
   const waiting = [];
@@ -19,6 +45,28 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
     espn: { state: 'idle', lastSuccess: null, message: 'Awaiting first request' },
     odds: { state: oddsKey ? 'idle' : 'unconfigured', lastSuccess: null, message: oddsKey ? 'Awaiting first request' : 'API key required' },
   };
+  const lineSnapshots = new Map();
+  const lastRecordedFetch = new Map();
+
+  function recordLineMovement(sport, events, time) {
+    if (lastRecordedFetch.get(sport) === time) return;
+    lastRecordedFetch.set(sport, time);
+    for (const event of events || []) {
+      const snapshot = snapshotMoneyline(event, time);
+      if (!snapshot) continue;
+      const key = `${sport}:${event.id}`;
+      const list = lineSnapshots.get(key) || [];
+      const last = list.at(-1);
+      if (!last || last.home !== snapshot.home || last.away !== snapshot.away || JSON.stringify(last.books) !== JSON.stringify(snapshot.books)) {
+        list.push(snapshot);
+        if (list.length > LINE_HISTORY_MAX_SNAPSHOTS) list.shift();
+      }
+      lineSnapshots.set(key, list);
+    }
+    const cutoff = Date.now() - LINE_HISTORY_MAX_AGE;
+    for (const [key, list] of lineSnapshots) if (new Date(list.at(-1)?.time || 0).getTime() < cutoff) lineSnapshots.delete(key);
+    while (lineSnapshots.size > LINE_HISTORY_MAX_EVENTS) lineSnapshots.delete(lineSnapshots.keys().next().value);
+  }
 
   async function request(key, url, ttl, provider) {
     const hit = cache.get(key);
@@ -58,11 +106,38 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
     status: () => ({ espn: { ...health.espn }, odds: { ...health.odds }, serverTime: new Date().toISOString() }),
     async scoreboard(sport) {
       const result = await espn(sport, 'scoreboard', 20000);
+      const games = (result.data.events || []).map((event) => normalizeEvent(event, sport, source(sport, 'scoreboard', result.time))).filter(Boolean);
+      try { ledger.reconcile(sport, games); } catch { /* reconciliation must never break a scoreboard request */ }
       return {
-        games: (result.data.events || []).map((event) => normalizeEvent(event, sport, source(sport, 'scoreboard', result.time))).filter(Boolean),
+        games,
         season: result.data.leagues?.[0]?.season?.year || new Date().getFullYear(),
         fetchedAt: new Date(result.time).toISOString(),
         source: 'ESPN',
+      };
+    },
+    async recordPrediction(sport, entry) {
+      const board = await feeds.scoreboard(sport);
+      const game = board.games.find((item) => item.id === entry.eventId);
+      if (!game || game.completed) return { recorded: false, message: 'This event is not on the current, in-progress scoreboard.' };
+      return { recorded: true, entry: ledger.record({ ...entry, sport, homeTeam: game.home.name, awayTeam: game.away.name }) };
+    },
+    predictionStats: (sport) => ledger.stats(sport),
+    async injuries(sport) {
+      const result = await espn(sport, 'injuries', 300000);
+      return {
+        teams: (Array.isArray(result.data.injuries) ? result.data.injuries : []).filter((team) => team.id).map((team) => ({
+          teamId: String(team.id),
+          team: team.displayName || team.name || 'Unknown team',
+          injuries: (Array.isArray(team.injuries) ? team.injuries : []).filter((injury) => injury.athlete?.displayName).map((injury) => ({
+            id: String(injury.id || injury.athlete.id || injury.athlete.displayName),
+            athlete: injury.athlete.displayName,
+            status: injury.status || 'Status unavailable',
+            date: injury.date || null,
+            comment: injury.shortComment || injury.longComment || '',
+          })),
+        })),
+        fetchedAt: new Date(result.time).toISOString(),
+        source: source(sport, 'injuries', result.time),
       };
     },
     async history(sport, team, season) {
@@ -97,14 +172,25 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
     async odds(sport) {
       if (!oddsKey) return { configured: false, events: [], fetchedAt: null };
       const query = new URLSearchParams({ apiKey: oddsKey, regions: 'us', markets: 'h2h', oddsFormat: 'decimal', bookmakers: 'draftkings,fanduel,betmgm' });
-      const result = await request(`odds:${sport}`, `https://api.the-odds-api.com/v4/sports/${SPORTS[sport].odds}/odds/?${query}`, 180000, 'odds');
+      const result = await request(`odds:${sport}`, `https://api.the-odds-api.com/v4/sports/${SPORTS[sport].odds}/odds/?${query}`, ODDS_TTL, 'odds');
+      recordLineMovement(sport, result.data, result.time);
       return { configured: true, events: result.data, fetchedAt: new Date(result.time).toISOString() };
+    },
+    async lineHistory(sport, eventId) {
+      if (!oddsKey) return { configured: false, eventId: null, snapshots: [] };
+      const board = await feeds.scoreboard(sport);
+      const game = board.games.find((entry) => entry.id === eventId);
+      if (!game) return { configured: true, eventId: null, snapshots: [], message: 'This event is not on the current scoreboard.' };
+      const odds = await feeds.odds(sport);
+      const oddsEvent = findOddsEvent(game, odds.events);
+      if (!oddsEvent) return { configured: true, eventId: null, snapshots: [], message: 'No sportsbook event matches these teams and start time.' };
+      return { configured: true, eventId: oddsEvent.id, snapshots: lineSnapshots.get(`${sport}:${oddsEvent.id}`) || [] };
     },
     async markets(sport, eventId, marketKey, window = 10) {
       if (!oddsKey) return { configured: false, signals: [], message: 'Connect The Odds API to retrieve actual market lines.' };
       const cacheKey = `analysis:${sport}:${eventId}:${marketKey}:${window}`;
       const hit = cache.get(cacheKey);
-      if (hit && Date.now() - hit.time < 180000) return hit.data;
+      if (hit && Date.now() - hit.time < ODDS_TTL) return hit.data;
       const board = await feeds.scoreboard(sport);
       const game = board.games.find((entry) => entry.id === eventId && !entry.completed);
       if (!game) return { configured: true, signals: [], message: 'This event is not on the current active scoreboard.' };
@@ -112,7 +198,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
       const oddsEvent = findOddsEvent(game, odds.events);
       if (!oddsEvent) return { configured: true, signals: [], message: 'No sportsbook event matches these teams and start time.' };
       const query = new URLSearchParams({ apiKey: oddsKey, regions: 'us', markets: marketKey, oddsFormat: 'decimal', bookmakers: 'draftkings,fanduel,betmgm' });
-      const prices = await request(`event-odds:${sport}:${oddsEvent.id}:${marketKey}`, `https://api.the-odds-api.com/v4/sports/${SPORTS[sport].odds}/events/${oddsEvent.id}/odds?${query}`, 180000, 'odds');
+      const prices = await request(`event-odds:${sport}:${oddsEvent.id}:${marketKey}`, `https://api.the-odds-api.com/v4/sports/${SPORTS[sport].odds}/events/${oddsEvent.id}/odds?${query}`, ODDS_TTL, 'odds');
       const quotes = marketQuotes(game, [prices.data], marketKey);
       if (!quotes.length) return { configured: true, signals: [], message: 'The selected market is not currently offered by the connected sportsbooks.' };
       const histories = await Promise.all([feeds.history(sport, game.home.id, board.season), feeds.history(sport, game.away.id, board.season)]);

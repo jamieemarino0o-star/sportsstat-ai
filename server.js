@@ -1,10 +1,24 @@
 import express from 'express';
 import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { createFeeds, SPORTS } from './src/feeds.js';
+import { createLedger } from './src/ledger.js';
+import { auditReport } from './src/audit.js';
 import { SPORT_MARKETS } from './public/js/markets.js';
+
+const OPTIMIZED_PARAMS_FILE = fileURLToPath(new URL('./data/optimized-params.json', import.meta.url));
+const LEDGER_FILE = fileURLToPath(new URL('./data/predictions.jsonl', import.meta.url));
+
+// Reads the config file src/optimize.js writes (recency decay / SOS weight winners plus the
+// fractional Kelly grid search), regenerated periodically offline via `npm run optimize`. Read
+// fresh on every request rather than cached: the file is tiny and only changes when the script is
+// re-run, and this keeps the endpoint honest without requiring a server restart to pick up updates.
+function readOptimizedParams() {
+  try { return JSON.parse(readFileSync(OPTIMIZED_PARAMS_FILE, 'utf8')); } catch { return { generatedAt: null, sports: {} }; }
+}
 
 export function createApp(feeds = createFeeds()) {
   const app = express();
@@ -24,7 +38,24 @@ export function createApp(feeds = createFeeds()) {
     crossOriginEmbedderPolicy: false,
   }));
   app.use('/api', rateLimit({ windowMs: 60000, limit: 150, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many requests. Please try again in a minute.' } }));
+  app.use('/api/predictions', express.json({ limit: '4kb' }));
   app.get('/api/status', (req, res) => res.json(feeds.status()));
+  app.get('/api/optimized-params', (req, res) => {
+    const params = readOptimizedParams();
+    if (req.query.sport && Object.hasOwn(SPORTS, req.query.sport)) {
+      return res.json({ generatedAt: params.generatedAt, sport: params.sports?.[req.query.sport] || null });
+    }
+    res.json(params);
+  });
+  // Spans every sport in one payload (like /api/optimized-params above), so it is registered before
+  // the sport-validation middleware and only checks ?sport= manually when it is present. Reads the
+  // ledger file fresh on every request: it's an append-only log that changes only as games resolve,
+  // so there is no server-side caching to invalidate and no risk of a stale audit after a restart.
+  app.get('/api/audit', (req, res) => {
+    const sport = req.query.sport && Object.hasOwn(SPORTS, req.query.sport) ? req.query.sport : null;
+    const kellyFraction = Number(req.query.kellyFraction);
+    res.json(auditReport(LEDGER_FILE, { sport, kellyFraction: Number.isFinite(kellyFraction) && kellyFraction > 0 && kellyFraction <= 1 ? kellyFraction : 0.25 }));
+  });
   app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
     if (!Object.hasOwn(SPORTS, req.query.sport)) return res.status(400).json({ error: 'Choose a supported sport: nfl, nba, wnba, mlb, nhl, epl.' });
@@ -34,7 +65,24 @@ export function createApp(feeds = createFeeds()) {
     try { res.json(await handler(req)); } catch (error) { next(error); }
   };
   app.get('/api/scoreboard', route((req) => feeds.scoreboard(req.query.sport)));
+  app.get('/api/injuries', route((req) => feeds.injuries(req.query.sport)));
   app.get('/api/odds', route((req) => feeds.odds(req.query.sport)));
+  app.get('/api/odds/history', (req, res, next) => {
+    if (!/^\d{1,12}$/.test(req.query.event || '')) return res.status(400).json({ error: 'A valid event ID is required.' });
+    next();
+  }, route((req) => feeds.lineHistory(req.query.sport, req.query.event)));
+  app.post('/api/predictions', (req, res, next) => {
+    const body = req.body || {};
+    if (!/^\d{1,12}$/.test(String(body.eventId ?? '')) || !Number.isFinite(body.homeProbability) || body.homeProbability < 0 || body.homeProbability > 1) {
+      return res.status(400).json({ error: 'A valid event ID and a home win probability between 0 and 1 are required.' });
+    }
+    next();
+  }, route((req) => feeds.recordPrediction(req.query.sport, {
+    eventId: String(req.body.eventId), homeProbability: req.body.homeProbability, selection: req.body.selection,
+    window: req.body.window, decay: req.body.decay, sosWeight: req.body.sosWeight, sample: req.body.sample, expectedHome: req.body.expectedHome, expectedAway: req.body.expectedAway, marketImpliedHome: req.body.marketImpliedHome,
+    selectionPrice: req.body.selectionPrice,
+  })));
+  app.get('/api/predictions/stats', route((req) => feeds.predictionStats(req.query.sport)));
   app.get('/api/history', (req, res, next) => {
     if (!/^\d{1,8}$/.test(req.query.team || '') || !/^20\d{2}$/.test(req.query.season || '')) return res.status(400).json({ error: 'A valid team ID and season are required.' });
     next();
@@ -57,7 +105,11 @@ export function createApp(feeds = createFeeds()) {
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const port = Number(process.env.PORT || 3000);
-  const server = createApp().listen(port, process.env.HOST || '127.0.0.1', () => console.log(`SportsStat AI Predictor running at http://localhost:${port}`));
-  for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, () => server.close(() => process.exit(0)));
+  const PORT = process.env.PORT || 3000;
+  const server = createApp(createFeeds({ ledger: createLedger({ file: LEDGER_FILE }) })).listen(PORT, '0.0.0.0', () => {
+    console.log(`SportsStat AI Predictor running on all interfaces at port ${PORT}`);
+  });
+  for (const signal of ['SIGTERM', 'SIGINT']) {
+    process.on(signal, () => server.close(() => process.exit(0)));
+  }
 }

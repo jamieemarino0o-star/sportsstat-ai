@@ -14,17 +14,17 @@ export function betMetrics(slips, openingCents = 0) {
     roi: settledStakeCents ? profitCents / settledStakeCents : null };
 }
 
-export function createSlip(signal, stake, odds, availableCents, mode) {
+export function createSlip(signal, stake, odds, availableCents) {
   const stakeCents = Math.round(Number(stake) * 100);
   const price = Number(odds);
   if (!Number.isSafeInteger(stakeCents) || stakeCents <= 0 || stakeCents > 100000000) throw new Error('Enter a stake between $0.01 and $1,000,000.');
   if (!Number.isFinite(price) || price <= 1 || price > 10000) throw new Error('Decimal odds must be greater than 1 and at most 10,000.');
   if (stakeCents > availableCents) throw new Error('Stake exceeds your available bankroll.');
-  if (!['live', 'demo'].includes(mode) || !MARKETS[signal.quote?.market] || !signal.game?.id) throw new Error('This signal cannot be tracked.');
+  if (!MARKETS[signal.quote?.market] || !signal.game?.id) throw new Error('This signal cannot be tracked.');
   if (signal.game.completed) throw new Error('Completed games cannot be added as active bets.');
   const model = structuredClone(signal.analysis);
   if (model) model.ev = Number.isFinite(model.probability) ? (model.probability * price + (model.pushProbability || 0) - 1) * 100 : null;
-  return { id: crypto.randomUUID(), mode, sport: signal.game.sport, eventId: signal.game.id, game: structuredClone(signal.game),
+  return { id: crypto.randomUUID(), sport: signal.game.sport, eventId: signal.game.id, game: structuredClone(signal.game),
     quote: structuredClone(signal.quote), selection: signal.label, model,
     stakeCents, odds: price, status: 'active', createdAt: new Date().toISOString(), settledAt: null, audit: [] };
 }
