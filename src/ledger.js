@@ -2,11 +2,14 @@ import { appendFileSync, readFileSync, mkdirSync, existsSync, writeFileSync } fr
 import { dirname } from 'node:path';
 
 const MAX_ENTRIES_PER_SPORT = 4000;
+const MAX_DECIMAL_PRICE = 1001; // +100000 American: anything above is a corrupt or fabricated quote
 const STALE_PENDING_AGE = 120 * 24 * 60 * 60 * 1000;
 const MIN_BIAS_SAMPLE = 20;
 const MIN_WINDOW_SAMPLE = 15;
 const MIN_DECAY_SAMPLE = 15;
 const MIN_SOS_SAMPLE = 15;
+
+const validDate = (value) => (value && !Number.isNaN(Date.parse(value)) ? new Date(value).toISOString() : null);
 
 function actualOutcome(home, away) {
   if (home === away) return 0.5;
@@ -17,19 +20,33 @@ function actualOutcome(home, away) {
 // final result once ESPN reports the game as complete. This is what step 1 and 2 of the feedback
 // loop need: an immutable record of what was predicted, and an automated reconciliation against
 // the actual outcome (binary result + Brier score) once it is known.
-export function createLedger({ file = null } = {}) {
+// `notifier` (optional, e.g. createTelegramNotifier() from src/notifier.js) receives
+// notifyNewBet(entry) the first time an event gets a priced pick (or the pick flips sides) and
+// notifyResult(entry) when that event is reconciled. Notifier failures never affect the ledger.
+export function createLedger({ file = null, notifier = null, logger = console } = {}) {
   const entries = new Map(); // key: `${sport}:${eventId}`
+  // A crash or full disk mid-write can leave a final line without its newline; the next append would
+  // then be glued onto it and both records lost. Tracked so append() can terminate a torn tail first.
+  let needsNewline = false;
+  let lastWriteError = null;
+  const notify = (method, entry) => {
+    try { notifier?.[method]?.(entry)?.catch?.(() => {}); } catch { /* notifications are best-effort */ }
+  };
 
   function load() {
     if (!file) return;
     let raw = '';
     try { raw = readFileSync(file, 'utf8'); } catch { return; }
+    needsNewline = raw.length > 0 && !raw.endsWith('\n');
     for (const line of raw.split('\n')) {
       if (!line.trim()) continue;
       let record;
       try { record = JSON.parse(line); } catch { continue; }
+      if (!record || typeof record !== 'object' || !record.sport || !record.eventId) continue;
       const key = `${record.sport}:${record.eventId}`;
-      if (record.type === 'prediction') entries.set(key, { ...record });
+      // Settled results are final: a stray later prediction line (e.g. written by a second server
+      // process sharing the file) must not reopen a resolved event.
+      if (record.type === 'prediction') { if (!entries.get(key)?.resolved) entries.set(key, { ...record }); }
       else if (record.type === 'result') {
         const existing = entries.get(key);
         if (existing) entries.set(key, { ...existing, ...record });
@@ -42,13 +59,21 @@ export function createLedger({ file = null } = {}) {
     try {
       mkdirSync(dirname(file), { recursive: true });
       if (!existsSync(file)) writeFileSync(file, '');
-      appendFileSync(file, `${JSON.stringify(record)}\n`);
-    } catch { /* persistence failures should never break a request */ }
+      // One appendFileSync call per record: a single O_APPEND write that Node's single thread can't
+      // interleave with another write from this process.
+      appendFileSync(file, `${needsNewline ? '\n' : ''}${JSON.stringify(record)}\n`);
+      needsNewline = false;
+      lastWriteError = null;
+    } catch (error) {
+      // Never break a request, but never fail silently either: log once per distinct error code.
+      if (lastWriteError !== error.code) logger.error?.(`[ledger] failed to persist ${record.type} for ${record.sport}:${record.eventId} (${error.code || error.message})`);
+      lastWriteError = error.code;
+    }
   }
 
   load();
 
-  function record({ sport, eventId, homeTeam, awayTeam, homeProbability, selection, window, decay, sosWeight, sample, expectedHome, expectedAway, marketImpliedHome, selectionPrice }) {
+  function record({ sport, eventId, homeTeam, awayTeam, gameDate, homeProbability, selection, window, decay, sosWeight, sample, expectedHome, expectedAway, marketImpliedHome, selectionPrice }) {
     if (!sport || !eventId || !Number.isFinite(homeProbability) || homeProbability < 0 || homeProbability > 1) return null;
     const key = `${sport}:${eventId}`;
     const existing = entries.get(key);
@@ -56,6 +81,8 @@ export function createLedger({ file = null } = {}) {
     const loggedAt = existing?.loggedAt || new Date().toISOString();
     const entry = {
       type: 'prediction', sport, eventId: String(eventId), homeTeam: homeTeam || existing?.homeTeam || null, awayTeam: awayTeam || existing?.awayTeam || null,
+      // Scheduled kickoff/tip-off time (ISO), shown in the Audit Lab and used to bucket its win calendar.
+      gameDate: validDate(gameDate) || existing?.gameDate || null,
       homeProbability, selection: selection === 'home' || selection === 'away' ? selection : null, window: window === 20 ? 20 : 10,
       decay: Number.isFinite(decay) && decay > 0 && decay <= 1 ? Number(decay.toFixed(4)) : 1,
       // The strength-of-schedule adjustment weight applied when this snapshot was generated (see
@@ -67,11 +94,17 @@ export function createLedger({ file = null } = {}) {
       // Decimal odds for the model's picked side, matched at the moment this snapshot was logged. Logged on
       // every refresh cycle up to kickoff so the append-only file below captures an opening and closing
       // price per event for the backtest script (src/backtest.js) to compute ROI and closing-line value from.
-      selectionPrice: Number.isFinite(selectionPrice) && selectionPrice > 1 ? selectionPrice : null,
+      selectionPrice: Number.isFinite(selectionPrice) && selectionPrice > 1 && selectionPrice <= MAX_DECIMAL_PRICE ? selectionPrice : null,
       loggedAt, updatedAt: new Date().toISOString(), resolved: false,
     };
+    // record() runs on every refresh cycle up to kickoff, so announce each event at most once
+    // (persisted, so restarts don't re-announce): re-announcing on side flips would let anyone
+    // toggling `selection` through the public POST /api/predictions route spam the Telegram chat.
+    const announceNow = Boolean(entry.selection && entry.selectionPrice && !existing?.announced);
+    entry.announced = Boolean(existing?.announced || announceNow);
     entries.set(key, entry);
     append(entry);
+    if (announceNow) notify('notifyNewBet', entry);
     return entry;
   }
 
@@ -82,16 +115,19 @@ export function createLedger({ file = null } = {}) {
       const key = `${sport}:${game.id}`;
       const entry = entries.get(key);
       if (!entry || entry.resolved) continue;
-      const homeScore = game.home.score;
-      const awayScore = game.away.score;
+      const homeScore = game.home?.score;
+      const awayScore = game.away?.score;
+      // Never settle on a missing/garbled score: leave it pending for the next reconciliation pass.
+      if (!Number.isFinite(homeScore) || !Number.isFinite(awayScore)) continue;
       const outcome = actualOutcome(homeScore, awayScore);
       const brier = (entry.homeProbability - outcome) ** 2;
       const favoriteCorrect = entry.selection ? (entry.selection === 'home' ? homeScore >= awayScore : awayScore >= homeScore) : null;
-      const result = { type: 'result', sport, eventId: entry.eventId, resolved: true, homeScore, awayScore, outcome, brier, favoriteCorrect, resolvedAt: new Date().toISOString() };
+      const result = { type: 'result', sport, eventId: entry.eventId, gameDate: validDate(game.date) || entry.gameDate || null, resolved: true, homeScore, awayScore, outcome, brier, favoriteCorrect, resolvedAt: new Date().toISOString() };
       const updated = { ...entry, ...result };
       entries.set(key, updated);
       append(result);
       resolvedNow.push(updated);
+      notify('notifyResult', updated);
     }
     prune();
     return resolvedNow;
@@ -101,7 +137,10 @@ export function createLedger({ file = null } = {}) {
     const cutoff = Date.now() - STALE_PENDING_AGE;
     for (const [key, entry] of entries) if (!entry.resolved && new Date(entry.loggedAt).getTime() < cutoff) entries.delete(key);
     const bySport = new Map();
-    for (const [key, entry] of entries) bySport.set(entry.sport, [...(bySport.get(entry.sport) || []), key]);
+    for (const [key, entry] of entries) {
+      if (!bySport.has(entry.sport)) bySport.set(entry.sport, []);
+      bySport.get(entry.sport).push(key);
+    }
     for (const keys of bySport.values()) {
       const excess = keys.length - MAX_ENTRIES_PER_SPORT;
       for (let index = 0; index < excess; index += 1) entries.delete(keys[index]);
@@ -144,5 +183,15 @@ export function createLedger({ file = null } = {}) {
     return { sport, pending: all.length - resolved.length, ...overall, windows, bestWindow, biasFactor, decays, bestDecay, sosWeights, bestSosWeight };
   }
 
-  return { record, reconcile, stats, size: () => entries.size };
+  // Pending predictions whose game should be over (kickoff + `graceMs`, or logged + `graceMs` for
+  // entries written before gameDate was recorded). Used to settle games that dropped off the live
+  // scoreboard before they could be reconciled there.
+  function overdue(sport, { now = Date.now(), graceMs = 4 * 60 * 60 * 1000, limit = 5 } = {}) {
+    return [...entries.values()]
+      .filter((entry) => entry.sport === sport && !entry.resolved && new Date(entry.gameDate || entry.loggedAt).getTime() + graceMs < now)
+      .sort((first, second) => new Date(first.gameDate || first.loggedAt) - new Date(second.gameDate || second.loggedAt))
+      .slice(0, limit);
+  }
+
+  return { record, reconcile, overdue, stats, size: () => entries.size };
 }

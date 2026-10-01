@@ -112,3 +112,48 @@ test('persists predictions and results to disk and reloads them on restart', () 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('hardening: torn tail repair, finality on reload, invalid scores and prices, overdue lookup, once-only announcements', async () => {
+  const { mkdtempSync, rmSync, writeFileSync, readFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = mkdtempSync(join(tmpdir(), 'sportsstat-ledger-hard-'));
+  try {
+    const file = join(dir, 'predictions.jsonl');
+    const base = { type: 'prediction', sport: 'nfl', homeProbability: 0.6, selection: 'home', loggedAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z', resolved: false };
+    writeFileSync(file, [
+      JSON.stringify({ ...base, eventId: '1' }),
+      JSON.stringify({ type: 'result', sport: 'nfl', eventId: '1', resolved: true, homeScore: 7, awayScore: 3, outcome: 1, brier: 0.16 }),
+      JSON.stringify({ ...base, eventId: '1' }), // stray post-result prediction (second process)
+      '{"type":"prediction","sport":"nfl","eventId":"2","homePro', // torn write, no newline
+    ].join('\n'));
+    const ledger = createLedger({ file, logger: {} });
+    assert.equal(ledger.stats('nfl').sample, 1, 'a later prediction line must not reopen a settled event');
+
+    ledger.record({ sport: 'nfl', eventId: '3', homeTeam: 'A', awayTeam: 'B', gameDate: '2026-09-02T00:00:00Z', homeProbability: 0.55, selection: 'home', selectionPrice: 5000 });
+    const lines = readFileSync(file, 'utf8').split('\n').filter(Boolean);
+    const last = JSON.parse(lines.at(-1));
+    assert.equal(last.eventId, '3', 'the new record is on its own line after the torn tail');
+    assert.equal(last.selectionPrice, null, 'implausible prices are discarded');
+
+    assert.deepEqual(ledger.reconcile('nfl', [{ id: '3', completed: true, home: { score: NaN }, away: { score: 3 } }]), [], 'never settle on a missing score');
+    assert.deepEqual(ledger.overdue('nfl', { now: Date.parse('2026-09-02T05:00:00Z') }).map((entry) => entry.eventId), ['3']);
+    assert.deepEqual(ledger.overdue('nfl', { now: Date.parse('2026-09-02T02:00:00Z') }), [], 'not overdue inside the grace window');
+
+    const announced = [];
+    const notifying = createLedger({ file, logger: {}, notifier: { notifyNewBet: (entry) => announced.push(entry.eventId) } });
+    notifying.record({ sport: 'nfl', eventId: '4', homeProbability: 0.6, selection: 'home', selectionPrice: 1.9 });
+    const reloaded = createLedger({ file, logger: {}, notifier: { notifyNewBet: (entry) => announced.push(entry.eventId) } });
+    reloaded.record({ sport: 'nfl', eventId: '4', homeProbability: 0.4, selection: 'away', selectionPrice: 2.2 });
+    assert.deepEqual(announced, ['4'], 'announcement state survives a restart and side flips');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('hardening: persistence failures are logged once, never thrown', () => {
+  const errors = [];
+  const ledger = createLedger({ file: '/dev/null/not-a-dir/predictions.jsonl', logger: { error: (message) => errors.push(message) } });
+  assert.ok(ledger.record({ sport: 'nfl', eventId: '1', homeProbability: 0.5 }));
+  assert.ok(ledger.record({ sport: 'nfl', eventId: '2', homeProbability: 0.5 }));
+  assert.equal(errors.length, 1);
+  assert.doesNotMatch(errors[0], /token|key/i);
+});

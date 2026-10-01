@@ -36,6 +36,8 @@ function snapshotMoneyline(event, time) {
   return { time: new Date(time).toISOString(), home: homePrices.length ? Math.max(...homePrices) : null, away: awayPrices.length ? Math.max(...awayPrices) : null, books };
 }
 
+const OVERDUE_SWEEP_INTERVAL = 15 * 60 * 1000;
+
 export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY, ledger = createLedger() } = {}) {
   const cache = new Map();
   const pending = new Map();
@@ -99,6 +101,25 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
     try { return await task; } finally { pending.delete(key); }
   }
 
+  // Settles pending predictions whose games dropped off the live scoreboard before they could be
+  // reconciled there, via each event's own ESPN summary. Throttled per sport, capped per pass,
+  // and fully fire-and-forget: it can never reject or delay a scoreboard response.
+  const lastSweep = new Map();
+  async function sweepOverdue(sport, games, now = Date.now()) {
+    try {
+      if (!ledger.overdue || now - (lastSweep.get(sport) || 0) < OVERDUE_SWEEP_INTERVAL) return;
+      lastSweep.set(sport, now);
+      const onBoard = new Set(games.map((game) => game.id));
+      const targets = ledger.overdue(sport, { now }).filter((entry) => !onBoard.has(entry.eventId) && /^\d{1,12}$/.test(entry.eventId));
+      for (const entry of targets) {
+        try {
+          const { game } = await feeds.summary(sport, entry.eventId, true);
+          if (game?.completed) ledger.reconcile(sport, [game]);
+        } catch { /* try again on the next sweep */ }
+      }
+    } catch { /* never surface */ }
+  }
+
   const espn = (sport, resource, ttl) => request(`${sport}:${resource}`, `https://site.api.espn.com/apis/site/v2/sports/${SPORTS[sport].path}/${resource}`, ttl, 'espn');
   const source = (sport, resource, time) => ({ provider: 'ESPN', url: `https://site.api.espn.com/apis/site/v2/sports/${SPORTS[sport].path}/${resource}`, fetchedAt: new Date(time).toISOString() });
 
@@ -108,6 +129,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
       const result = await espn(sport, 'scoreboard', 20000);
       const games = (result.data.events || []).map((event) => normalizeEvent(event, sport, source(sport, 'scoreboard', result.time))).filter(Boolean);
       try { ledger.reconcile(sport, games); } catch { /* reconciliation must never break a scoreboard request */ }
+      void sweepOverdue(sport, games);
       return {
         games,
         season: result.data.leagues?.[0]?.season?.year || new Date().getFullYear(),
@@ -118,8 +140,10 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
     async recordPrediction(sport, entry) {
       const board = await feeds.scoreboard(sport);
       const game = board.games.find((item) => item.id === entry.eventId);
-      if (!game || game.completed) return { recorded: false, message: 'This event is not on the current, in-progress scoreboard.' };
-      return { recorded: true, entry: ledger.record({ ...entry, sport, homeTeam: game.home.name, awayTeam: game.away.name }) };
+      // Pre-game only: an in-play write would log live odds as the "closing" price (corrupting CLV/ROI)
+      // and let a pick be revised after kickoff.
+      if (!game || game.completed || game.state !== 'pre') return { recorded: false, message: 'Predictions are only accepted for scheduled games that have not started.' };
+      return { recorded: true, entry: ledger.record({ ...entry, sport, homeTeam: game.home.name, awayTeam: game.away.name, gameDate: game.date }) };
     },
     predictionStats: (sport) => ledger.stats(sport),
     async injuries(sport) {

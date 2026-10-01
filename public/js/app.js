@@ -67,7 +67,7 @@ function sosWeightFor(gameId) {
 // starts) price per event, which the backtest script (src/backtest.js) uses for ROI and CLV.
 // Best-effort and silent: a logging failure should never affect what the user sees.
 function postPrediction(game, prediction) {
-  if (game.completed || !Number.isFinite(prediction.homeProbability)) return;
+  if (game.completed || game.state !== 'pre' || !Number.isFinite(prediction.homeProbability)) return;
   const price = bestPrice(game, prediction);
   fetch(`/api/predictions?sport=${state.sport}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },

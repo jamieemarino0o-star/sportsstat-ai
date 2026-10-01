@@ -35,6 +35,18 @@ Set `ODDS_API_KEY` in `.env`, then restart Node. Never put the key in frontend c
 
 Without a key, live scores and historical analysis still work, but actual sportsbook markets remain unavailable.
 
+## Telegram Notifications
+
+`src/notifier.js` sends a Telegram message whenever the prediction ledger logs a new priced pick and when that game is reconciled as final. Create a bot with [@BotFather](https://t.me/BotFather), message it once, then set in `.env`:
+
+```sh
+TELEGRAM_BOT_TOKEN=123456:ABC...
+TELEGRAM_CHAT_ID=123456789
+TELEGRAM_MIN_EV=3   # optional: only announce picks with EV >= 3%
+```
+
+Restart Node and run `npm run telegram:test` to confirm delivery. A pick is announced once per event (again only if the model flips sides), not on every refresh; results are announced once on reconciliation. Sends are queued about one per second, and failures are logged without the token and never affect the ledger. Without both variables, notifications are disabled.
+
 ## Workspace
 
 - **Dashboard:** schedules, live scores, model signals, featured matchup, upcoming games and provider win probabilities.
@@ -44,7 +56,7 @@ Without a key, live scores and historical analysis still work, but actual sports
 - **Bet Tracker:** record personal slips and manually entered odds, manage opening bankroll, review active exposure, win rate, ROI and settlement history, and export the local ledger. ESPN final-score checks are suggestions only; settlement requires confirmation.
 - **Live Match Tracker:** live scores, ESPN win-probability series, injury reports, automated match notes, play-by-play, team statistics and available player box scores.
 - **API Feeds Status:** connection health, successful fetch times, odds quota, sportsbook setup and pipeline coverage.
-- **Audit Lab:** backtested KPI cards (ROI, win rate, Brier score, sample size), a stratified risk-tier/odds-bracket/sport performance table, plain-English amelioration insights, a walk-forward validation and Kelly-grid status panel, and a searchable/filterable/exportable ledger history grid. Sourced entirely from the persistent prediction ledger — see "Quant Audit & Amelioration Lab" under Model Methodology below.
+- **Audit Lab:** backtested KPI cards (ROI, win rate, Brier score, sample size), a stratified risk-tier/odds-bracket/sport performance table, plain-English amelioration insights, a win fraction calendar, a walk-forward validation and Kelly-grid status panel, and a searchable/filterable/exportable ledger history grid showing each game's date and start time. Sourced entirely from the persistent prediction ledger — see "Quant Audit & Amelioration Lab" under Model Methodology below.
 
 NFL, NBA, WNBA, MLB, NHL and EPL feeds are supported. Advanced market availability varies by league and provider. The default view loads the NFL feed. ESPN's default scoreboard can return its current week or next scheduled slate, not necessarily today's games; each matchup displays its actual date.
 
@@ -110,7 +122,7 @@ Historical frequency is not predictive accuracy. No backtested hit rate or profi
 
 ### Prediction ledger & calibration feedback loop
 
-Every pre-game moneyline prediction the browser computes is logged to a server-side, append-only ledger (`src/ledger.js`, persisted to `data/predictions.jsonl`, gitignored) via `POST /api/predictions`. Whenever any client polls `/api/scoreboard` and ESPN reports a logged event as complete, the server automatically reconciles that prediction against the final score — no separate cron job or timer is needed. A locked-in prediction is never overwritten once reconciled, so the ledger is an honest, unedited record of what the model said *before* the outcome was known.
+Every pre-game moneyline prediction the browser computes is logged to a server-side, append-only ledger (`src/ledger.js`, persisted to `data/predictions.jsonl`, gitignored) via `POST /api/predictions`. Whenever any client polls `/api/scoreboard` and ESPN reports a logged event as complete, the server automatically reconciles that prediction against the final score — no separate cron job or timer is needed. A locked-in prediction is never overwritten once reconciled, so the ledger is an honest, unedited record of what the model said *before* the outcome was known. Writes are accepted only while ESPN reports the game as scheduled (`state: pre`), so live in-play odds never become a "closing" price. Games that drop off the live scoreboard before they could be settled there are swept from their own ESPN summary at most every 15 minutes per sport, once they are 4+ hours past kickoff. Reconciliation skips missing scores rather than settling them as 0-0, prices above 1001 (decimal) are discarded, a torn final line from a crash is repaired before the next append, and write failures are logged once per error code rather than swallowed.
 
 `GET /api/predictions/stats?sport=nfl` exposes, per sport:
 
@@ -165,12 +177,13 @@ Once a backtest can measure performance across historical buckets, the natural n
 
 ### Quant Audit & Amelioration Lab (`src/audit.js`, `public/js/audit.js`)
 
-A dedicated **Audit Lab** workspace (sidebar → "Audit Lab") composes `src/backtest.js`'s ROI/Brier/CLV/drawdown/stratification engine with a few additions, all served through a single `GET /api/audit` endpoint (optional `?sport=nfl` and `?kellyFraction=0.25|0.5` query params; an invalid/missing sport is silently ignored rather than rejected, since the report defaults to all sports blended):
+A dedicated **Audit Lab** workspace (sidebar → "Audit Lab") composes `src/backtest.js`'s ROI/Brier/CLV/drawdown/stratification engine with a few additions, all served through a single `GET /api/audit` endpoint (optional `?sport=nfl`, `?kellyFraction=0.25|0.5` and `?tz=America/New_York` query params — `tz` is the viewer's IANA time zone, falling back to UTC when invalid; an invalid/missing sport is silently ignored rather than rejected, since the report defaults to all sports blended):
 
 - **Win rate** per bucket, layered onto `backtest.js`'s existing risk-tier/odds-bracket/sport stratifications (which only report ROI/Brier/CLV/sample) without modifying that module's tested return shape.
 - **Walk-forward validation** — a lightweight rolling-window stability check (default 20-trial windows, 10-trial step) over already-resolved, already-priced trials in ledger order. It reports each window's Brier score and ROI plus an early-vs-late drift metric, flagging when the model's calibration is trending worse over time. This is a stability/drift check on logged predictions, not a true offline retrain-and-replay backtest — recency decay and SOS weight remain live-tuned in the app itself (see above), since replaying them offline would require persisting every team's raw game log at prediction time.
 - **Amelioration & Insights** — plain-English diagnostic notes generated from the same computed report: a low-risk-tier bleed warning, underperforming odds-bracket/sport call-outs, a CLV read, a mismatch warning between the historically-recommended Kelly fraction and whatever fraction is actually configured in the bet tracker (`localStorage['sportsstat-kelly-fraction']`, read client-side and passed as `?kellyFraction=`), and a walk-forward drift warning. These are informational only — nothing is auto-applied to the live model.
-- **Ledger history grid** — unlike `backtest.js`'s `buildTrials` (which silently drops any prediction missing a selection, a matched price, or a result), the Audit Lab's history grid surfaces *every* logged prediction, pending or resolved, so gaps are visible rather than hidden. It's searchable by team/sport/event ID, filterable by outcome (all/resolved/pending/win/loss), capped at 200 displayed rows for performance, and exportable as a JSON file matching the full computed report.
+- **Ledger history grid** — unlike `backtest.js`'s `buildTrials` (which silently drops any prediction missing a selection, a matched price, or a result), the Audit Lab's history grid surfaces *every* logged prediction, pending or resolved, so gaps are visible rather than hidden. It's searchable by team/sport/event ID, filterable by outcome (all/resolved/pending/win/loss), capped at 200 displayed rows for performance, and exportable as a JSON file matching the full computed report. Each row shows the game's scheduled date and start time in the viewer's time zone (e.g. "Oct 1, 2026 - 8:15 PM"). The ledger stores this as `gameDate` on both prediction and result records, so predictions logged before the field existed are backfilled when they're reconciled; older rows still missing it show "Game time not recorded".
+- **Win fraction calendar** — a month grid of settled picks grouped by local game date, showing each day's wins over decided picks (`3/4`, `2/2`, …) color-coded green/amber/red, with pushes counted separately (`+1P`) rather than as losses. The month header totals the same fraction. Clicking a day filters the ledger history to that date. Picks are graded on the *opening* selection, the same one the backtest stakes, so the calendar, grid outcome pills and headline win rate always agree.
 
 `node src/audit.js [sport]` (or `npm run audit [-- sport]`) prints the same report from the command line. The Audit Lab view is schedule/scoreboard-independent (like Bet Tracker), so it's excluded from the app's 30-second background auto-refresh and from the loading/error gating that other views use.
 
@@ -192,7 +205,7 @@ Browser smoke checks:
 5. Switch leagues and market categories, select 10/20-game windows, inspect source weights, and add/settle a ledger slip. At mobile widths, use the navigation menu; tables scroll within their containers.
 6. Pause/resume auto-refresh, inspect API Feeds Status and open the model methodology dialog. Test keyboard navigation, Escape and dialog focus.
 7. Block `/api/scoreboard` using browser developer tools and reload. Confirm the retry state appears with a way to try again. CDN fonts, icons and images still require connectivity.
-8. Open Audit Lab, switch the sport filter, search/filter the ledger history grid (typing must not lose input focus), and export the JSON report.
+8. Open Audit Lab, page through the win fraction calendar and click a day, switch the sport filter, search/filter the ledger history grid (typing must not lose input focus), and export the JSON report.
 
 The dashboard has been checked in the integrated Chromium browser at desktop and mobile sizes. Native file-download behavior should also be smoke-tested in your regular browser; the integrated browser may suppress download events.
 
@@ -228,6 +241,10 @@ tests/server.test.js     Proxy and provider-adapter tests
 ## Before Public Production Use
 
 This is a working, production-minded starter, not a certified production betting system. In particular:
+
+- `POST /api/predictions` is unauthenticated, so on a public deployment anyone can write pre-game predictions for scheduled events into the shared ledger and skew its audit/backtest statistics. Put the deployment behind authentication, or move prediction generation server-side, before trusting the ledger. Telegram announces each event at most once to limit alert spam.
+- The ledger is a local file. Hosts with ephemeral disks (including Render without a persistent disk) erase `data/predictions.jsonl` on every deploy or restart: attach a persistent disk or move to a database. Run exactly one server process per ledger file; two processes would each reconcile and notify independently.
+- Behind a reverse proxy, set `TRUST_PROXY=1` so the API rate limit applies per client instead of to the proxy as a whole.
 
 - Confirm ESPN endpoint usage rights and obtain a licensed provider/SLA if needed. ESPN's public APIs are unofficial and can change without notice.
 - Backtest out-of-time, measure probability calibration, address data leakage and settlement rules, and add injury/lineup features before relying on estimates.

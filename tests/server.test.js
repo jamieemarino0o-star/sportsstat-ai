@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp } from '../server.js';
 import { createFeeds } from '../src/feeds.js';
+import { createLedger } from '../src/ledger.js';
 
 test('proxy validates parameters and hides its implementation header', async (context) => {
   const app = createApp({ status: () => ({ espn: { state: 'idle' } }), scoreboard: async () => ({ games: [] }), injuries: async () => ({ teams: [] }) });
@@ -35,6 +36,8 @@ test('proxy validates parameters and hides its implementation header', async (co
   const auditFiltered = await (await fetch(`${base}/api/audit?sport=nfl`)).json();
   assert.equal(auditFiltered.sport, 'nfl');
   assert.equal((await fetch(`${base}/api/audit?sport=bad`)).status, 200); // an invalid sport is silently ignored, not rejected, since this route spans every sport by default
+  assert.equal((await (await fetch(`${base}/api/audit?tz=America%2FNew_York`)).json()).calendar.timeZone, 'America/New_York');
+  assert.equal((await (await fetch(`${base}/api/audit?tz=bogus%2Fzone`)).json()).calendar.timeZone, 'UTC');
   const response = await fetch(`${base}/api/scoreboard?sport=nfl`);
   assert.deepEqual(await response.json(), { games: [] });
   const injuryResponse = await fetch(`${base}/api/injuries?sport=nfl`);
@@ -240,4 +243,43 @@ test('feed caching coalesces requests and reports upstream errors without secret
   const failed = createFeeds({ oddsKey: 'secret-test-key', fetcher: async () => { throw new Error('URL containing secret-test-key'); } });
   await assert.rejects(failed.odds('nfl'), /Upstream feed is unavailable/);
   assert.ok(!JSON.stringify(failed.status()).includes('secret-test-key'));
+});
+test('hardening: in-play writes are rejected and overdue predictions are settled from the event summary', async () => {
+  const competitors = (home, away) => [
+    { homeAway: 'home', team: { id: '17', displayName: 'Kansas City Chiefs' }, score: String(home) },
+    { homeAway: 'away', team: { id: '9', displayName: 'Buffalo Bills' }, score: String(away) },
+  ];
+  const live = { id: '600', date: new Date().toISOString(), competitions: [{ competitors: competitors(7, 3) }], status: { type: { state: 'in' } } };
+  const ledger = createLedger();
+  const fetched = [];
+  const fetcher = async (url) => {
+    fetched.push(url);
+    if (url.includes('summary?event=42')) return Response.json({ header: { competitions: [{ date: '2026-09-01T17:00:00Z', competitors: competitors(10, 24), status: { type: { state: 'post', completed: true } } }] } });
+    return Response.json({ events: [live] });
+  };
+  const feeds = createFeeds({ fetcher, ledger });
+  ledger.record({ sport: 'nfl', eventId: '42', homeTeam: 'Kansas City Chiefs', awayTeam: 'Buffalo Bills', gameDate: '2026-09-01T17:00:00Z', homeProbability: 0.7, selection: 'home' });
+  assert.equal((await feeds.recordPrediction('nfl', { eventId: '600', homeProbability: 0.6 })).recorded, false); // in play
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const summaryFetches = () => fetched.filter((url) => url.includes('summary?event=42')).length;
+  await feeds.scoreboard('nfl');
+  assert.equal(summaryFetches(), 1, 'sweeps are throttled per sport');
+  assert.ok(fetched.some((url) => url.includes('summary?event=42')));
+  const stats = ledger.stats('nfl');
+  assert.equal(stats.sample, 1);
+  assert.equal(stats.pending, 0);
+});
+
+test('hardening: malformed or oversized JSON gets a 4xx, not a 502', async () => {
+  const server = createApp(createFeeds({ fetcher: async () => Response.json({ events: [] }) })).listen(0);
+  try {
+    const base = `http://127.0.0.1:${server.address().port}/api/predictions?sport=nfl`;
+    const malformed = await fetch(base, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"eventId":' });
+    assert.equal(malformed.status, 400);
+    assert.deepEqual(await malformed.json(), { error: 'Malformed request.' });
+    const large = await fetch(base, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ pad: 'x'.repeat(8000) }) });
+    assert.equal(large.status, 413);
+    assert.equal((await fetch(base, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '[1,2]' })).status, 400);
+    assert.equal((await fetch(base.replace('predictions?sport=nfl', 'audit'))).headers.get('cache-control'), 'no-store');
+  } finally { server.close(); }
 });

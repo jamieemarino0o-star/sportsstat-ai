@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { createFeeds, SPORTS } from './src/feeds.js';
 import { createLedger } from './src/ledger.js';
-import { auditReport } from './src/audit.js';
+import { createTelegramNotifier } from './src/notifier.js';
+import { auditReport, isValidTimeZone } from './src/audit.js';
 import { SPORT_MARKETS } from './public/js/markets.js';
 
 const OPTIMIZED_PARAMS_FILE = fileURLToPath(new URL('./data/optimized-params.json', import.meta.url));
@@ -23,6 +24,10 @@ function readOptimizedParams() {
 export function createApp(feeds = createFeeds()) {
   const app = express();
   app.disable('x-powered-by');
+  // Behind a reverse proxy (e.g. Render), set TRUST_PROXY=1 so rate limiting keys on the real client
+  // IP rather than lumping every visitor into the proxy's single bucket. Off by default: trusting
+  // X-Forwarded-For without a proxy in front would let clients spoof their IP to dodge the limit.
+  if (process.env.TRUST_PROXY) app.set('trust proxy', /^\d+$/.test(process.env.TRUST_PROXY) ? Number(process.env.TRUST_PROXY) : process.env.TRUST_PROXY);
   app.use(helmet({
     contentSecurityPolicy: {
       directives: {
@@ -38,7 +43,9 @@ export function createApp(feeds = createFeeds()) {
     crossOriginEmbedderPolicy: false,
   }));
   app.use('/api', rateLimit({ windowMs: 60000, limit: 150, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many requests. Please try again in a minute.' } }));
-  app.use('/api/predictions', express.json({ limit: '4kb' }));
+  app.use('/api/predictions', express.json({ limit: '4kb', strict: true }));
+  // Ledger-derived payloads must never be cached by browsers or intermediaries.
+  app.use(['/api/audit', '/api/optimized-params'], (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   app.get('/api/status', (req, res) => res.json(feeds.status()));
   app.get('/api/optimized-params', (req, res) => {
     const params = readOptimizedParams();
@@ -54,7 +61,9 @@ export function createApp(feeds = createFeeds()) {
   app.get('/api/audit', (req, res) => {
     const sport = req.query.sport && Object.hasOwn(SPORTS, req.query.sport) ? req.query.sport : null;
     const kellyFraction = Number(req.query.kellyFraction);
-    res.json(auditReport(LEDGER_FILE, { sport, kellyFraction: Number.isFinite(kellyFraction) && kellyFraction > 0 && kellyFraction <= 1 ? kellyFraction : 0.25 }));
+    // ?tz= is the viewer's IANA time zone so the win calendar buckets games by their local date.
+    const timeZone = typeof req.query.tz === 'string' && req.query.tz.length <= 64 && isValidTimeZone(req.query.tz) ? req.query.tz : 'UTC';
+    res.json(auditReport(LEDGER_FILE, { sport, timeZone, kellyFraction: Number.isFinite(kellyFraction) && kellyFraction > 0 && kellyFraction <= 1 ? kellyFraction : 0.25 }));
   });
   app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
@@ -72,7 +81,7 @@ export function createApp(feeds = createFeeds()) {
     next();
   }, route((req) => feeds.lineHistory(req.query.sport, req.query.event)));
   app.post('/api/predictions', (req, res, next) => {
-    const body = req.body || {};
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
     if (!/^\d{1,12}$/.test(String(body.eventId ?? '')) || !Number.isFinite(body.homeProbability) || body.homeProbability < 0 || body.homeProbability > 1) {
       return res.status(400).json({ error: 'A valid event ID and a home win probability between 0 and 1 are required.' });
     }
@@ -99,17 +108,31 @@ export function createApp(feeds = createFeeds()) {
   app.use('/api', (req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
   app.use(express.static(fileURLToPath(new URL('./public', import.meta.url)), { etag: true, maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0 }));
   app.use((error, req, res, next) => {
-    res.status(502).json({ error: error.message || 'The upstream feed is temporarily unavailable.' });
+    // Client errors raised by middleware (malformed JSON, oversized body) keep their 4xx status and
+    // get a generic message; everything else is an upstream failure whose message feeds.js has
+    // already reduced to a safe, secret-free summary.
+    const status = Number.isInteger(error.status) && error.status >= 400 && error.status < 500 ? error.status : 502;
+    if (status === 502) return res.status(502).json({ error: error.message || 'The upstream feed is temporarily unavailable.' });
+    res.status(status).json({ error: status === 413 ? 'Request body is too large.' : 'Malformed request.' });
   });
   return app;
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const PORT = process.env.PORT || 3000;
-  const server = createApp(createFeeds({ ledger: createLedger({ file: LEDGER_FILE }) })).listen(PORT, '0.0.0.0', () => {
+  const notifier = createTelegramNotifier();
+  const server = createApp(createFeeds({ ledger: createLedger({ file: LEDGER_FILE, notifier }) })).listen(PORT, '0.0.0.0', () => {
     console.log(`SportsStat AI Predictor running on all interfaces at port ${PORT}`);
+    console.log(`Telegram notifications ${notifier.enabled ? 'enabled' : 'disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable)'}`);
   });
   for (const signal of ['SIGTERM', 'SIGINT']) {
-    process.on(signal, () => server.close(() => process.exit(0)));
+    process.on(signal, () => {
+      server.close(() => process.exit(0));
+      server.closeAllConnections?.();
+      setTimeout(() => process.exit(0), 5000).unref();
+    });
   }
+  // Every known async path already catches its own errors; this is a last line of defence so a
+  // missed rejection is logged instead of terminating the server mid-request.
+  process.on('unhandledRejection', (reason) => console.error('[server] unhandled rejection:', reason instanceof Error ? reason.message : reason));
 }

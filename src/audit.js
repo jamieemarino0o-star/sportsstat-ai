@@ -58,6 +58,48 @@ export function walkForwardValidation(trials, { windowSize = 20, step = 10 } = {
 // settled bets. Unlike buildTrials (which requires a selection, a matched price and a result to be
 // usable for staking math), this keeps every event so the grid can honestly show gaps in the data
 // (no price matched, no selection favored, or still awaiting a final score).
+// Grades the *opening* pick (the same side buildTrials() stakes in src/backtest.js), so the
+// history grid, calendar and headline win rate all agree. Ties are a push, not a win.
+function pickResult(selection, result) {
+  if (!result?.resolved || !selection || result.outcome == null) return null;
+  if (result.outcome === 0.5) return 'push';
+  return (selection === 'home') === (result.outcome === 1) ? 'win' : 'loss';
+}
+
+export function isValidTimeZone(timeZone) {
+  if (!timeZone || typeof timeZone !== 'string') return false;
+  try { new Intl.DateTimeFormat('en-US', { timeZone }); return true; } catch { return false; }
+}
+
+// YYYY-MM-DD for an instant in the given IANA time zone (en-CA formats dates as ISO).
+export function dayKey(value, timeZone = 'UTC') {
+  if (!value || Number.isNaN(Date.parse(value))) return null;
+  return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value));
+}
+
+// Daily win fraction over settled picks, bucketed by the game's local date in the viewer's time
+// zone (falling back to resolution time for older entries logged before gameDate was recorded).
+// The fraction is wins over decisive picks ("3/4"); pushes are counted separately, not as losses.
+export function buildWinCalendar(rows, { timeZone = 'UTC' } = {}) {
+  const days = new Map();
+  for (const row of rows) {
+    if (!row.pickResult) continue;
+    const date = dayKey(row.gameDate || row.resolvedAt || row.loggedAt, timeZone);
+    if (!date) continue;
+    const day = days.get(date) || { date, wins: 0, losses: 0, pushes: 0 };
+    if (row.pickResult === 'win') day.wins += 1;
+    else if (row.pickResult === 'loss') day.losses += 1;
+    else day.pushes += 1;
+    days.set(date, day);
+  }
+  return [...days.values()]
+    .map((day) => {
+      const decided = day.wins + day.losses;
+      return { ...day, settled: decided + day.pushes, decided, fraction: `${day.wins}/${decided}`, winRate: decided ? day.wins / decided : null };
+    })
+    .sort((first, second) => first.date.localeCompare(second.date));
+}
+
 export function buildLedgerRows(groups, { sport = null, limit = 500 } = {}) {
   const rows = [];
   for (const [key, group] of groups) {
@@ -67,6 +109,7 @@ export function buildLedgerRows(groups, { sport = null, limit = 500 } = {}) {
     const closing = chronological.at(-1);
     if (sport && opening.sport !== sport) continue;
     const result = group.result;
+    const gameDate = result?.gameDate || [...chronological].reverse().find((entry) => entry.gameDate)?.gameDate || null;
     rows.push({
       key, sport: opening.sport, eventId: opening.eventId, homeTeam: opening.homeTeam, awayTeam: opening.awayTeam,
       selection: opening.selection, homeProbability: opening.homeProbability,
@@ -74,7 +117,8 @@ export function buildLedgerRows(groups, { sport = null, limit = 500 } = {}) {
       window: opening.window, decay: opening.decay, sosWeight: opening.sosWeight,
       resolved: Boolean(result?.resolved), homeScore: result?.homeScore ?? null, awayScore: result?.awayScore ?? null,
       outcome: result?.outcome ?? null, favoriteCorrect: result?.favoriteCorrect ?? null, brier: result?.brier ?? null,
-      loggedAt: opening.loggedAt, resolvedAt: result?.resolvedAt ?? null,
+      pickResult: pickResult(opening.selection, result),
+      gameDate, loggedAt: opening.loggedAt, resolvedAt: result?.resolvedAt ?? null,
     });
   }
   return rows
@@ -164,7 +208,8 @@ export function generateInsights(result, { currentKellyFraction = 0.25 } = {}) {
 // file once, runs the full backtest (ROI/Brier/CLV/drawdown/stratification/Kelly grid), adds win
 // rate and walk-forward validation, generates plain-English insights from all of it, and returns
 // the interactive ledger history grid rows -- everything the Audit Lab page needs in one call.
-export function auditReport(file, { sport = null, kellyFraction = 0.25, historyLimit = 500 } = {}) {
+export function auditReport(file, { sport = null, kellyFraction = 0.25, historyLimit = 500, timeZone = 'UTC' } = {}) {
+  const zone = isValidTimeZone(timeZone) ? timeZone : 'UTC';
   const groups = readLedgerFile(file);
   const trials = buildTrials(groups, { sport });
   const backtest = runBacktest(trials);
@@ -174,7 +219,11 @@ export function auditReport(file, { sport = null, kellyFraction = 0.25, historyL
     byOddsBracket: attachWinRates(backtest.byOddsBracket, trials, (trial) => oddsBracket(trial.openingPrice)),
     bySport: attachWinRates(backtest.bySport, trials, (trial) => trial.sport),
   };
-  return { ...result, insights: generateInsights(result, { currentKellyFraction: kellyFraction }), history: buildLedgerRows(groups, { sport, limit: historyLimit }) };
+  const allRows = buildLedgerRows(groups, { sport, limit: Infinity });
+  return {
+    ...result, insights: generateInsights(result, { currentKellyFraction: kellyFraction }), history: allRows.slice(0, historyLimit),
+    calendar: { timeZone: zone, days: buildWinCalendar(allRows, { timeZone: zone }) },
+  };
 }
 
 function printReport(result) {
@@ -185,6 +234,8 @@ function printReport(result) {
   console.log(`ROI: ${pct(result.roi.roi, 2)}`);
   console.log(`Brier score: ${Number.isFinite(result.brier) ? result.brier.toFixed(4) : '--'}`);
   if (result.walkForward.windows.length) console.log(`Walk-forward drift: ${Number.isFinite(result.walkForward.drift) ? result.walkForward.drift.toFixed(4) : '--'} (${result.walkForward.windows.length} rolling windows of ${result.walkForward.windowSize})`);
+  const recentDays = result.calendar.days.slice(-7);
+  if (recentDays.length) console.log(`Daily win fraction (${result.calendar.timeZone}): ${recentDays.map((day) => `${day.date} ${day.fraction}`).join(' · ')}`);
   console.log('\nAmelioration & Insights');
   for (const insight of result.insights) console.log(`  [${insight.level.toUpperCase()}] ${insight.message}`);
   console.log('');

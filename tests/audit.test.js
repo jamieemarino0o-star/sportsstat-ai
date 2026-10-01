@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createLedger } from '../src/ledger.js';
-import { computeWinRate, walkForwardValidation, buildLedgerRows, generateInsights, auditReport } from '../src/audit.js';
+import { computeWinRate, walkForwardValidation, buildLedgerRows, buildWinCalendar, generateInsights, auditReport } from '../src/audit.js';
 import { parseLedgerLines } from '../src/backtest.js';
 
 function predictionLine(overrides) {
@@ -108,4 +108,41 @@ test('auditReport combines the backtest engine, win rate, walk-forward validatio
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('ledger rows carry the game date and grade the opening pick; the calendar groups settled picks by local game date', () => {
+  const resultLine = (eventId, homeScore, awayScore, gameDate) => JSON.stringify({ type: 'result', sport: 'nfl', eventId, resolved: true, homeScore, awayScore, outcome: homeScore === awayScore ? 0.5 : homeScore > awayScore ? 1 : 0, gameDate, resolvedAt: '2026-10-03T12:00:00Z' });
+  const groups = parseLedgerLines([
+    // 00:15 UTC on Oct 2 is still Oct 1 in New York.
+    predictionLine({ eventId: '1', gameDate: '2026-10-02T00:15:00Z' }), resultLine('1', 24, 10, '2026-10-02T00:15:00Z'),
+    predictionLine({ eventId: '2' }), resultLine('2', 3, 20, '2026-10-01T17:00:00Z'), // gameDate only on the result (backfill)
+    predictionLine({ eventId: '3', selection: 'away' }), resultLine('3', 7, 30, '2026-10-01T20:00:00Z'),
+    predictionLine({ eventId: '4' }), resultLine('4', 14, 14, '2026-10-01T21:00:00Z'),
+    predictionLine({ eventId: '5', gameDate: '2026-10-05T17:00:00Z' }), // pending: not settled
+    predictionLine({ eventId: '6', selection: null }), resultLine('6', 1, 0, '2026-10-01T18:00:00Z'), // no pick: not a bet
+  ]);
+  const rows = buildLedgerRows(groups);
+  const byId = Object.fromEntries(rows.map((row) => [row.eventId, row]));
+  assert.equal(byId['1'].gameDate, '2026-10-02T00:15:00Z');
+  assert.equal(byId['2'].gameDate, '2026-10-01T17:00:00Z');
+  assert.deepEqual(['1', '2', '3', '4', '5', '6'].map((id) => byId[id].pickResult), ['win', 'loss', 'win', 'push', null, null]);
+
+  assert.deepEqual(buildWinCalendar(rows, { timeZone: 'America/New_York' }), [
+    { date: '2026-10-01', wins: 2, losses: 1, pushes: 1, settled: 4, decided: 3, fraction: '2/3', winRate: 2 / 3 },
+  ]);
+  assert.deepEqual(buildWinCalendar(rows, { timeZone: 'UTC' }).map((day) => [day.date, day.fraction]), [['2026-10-01', '1/2'], ['2026-10-02', '1/1']]);
+});
+
+test('auditReport exposes the calendar in the requested time zone and falls back to UTC for invalid zones', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'sportsstat-audit-cal-'));
+  try {
+    const file = join(dir, 'predictions.jsonl');
+    const ledger = createLedger({ file });
+    ledger.record({ sport: 'nfl', eventId: '9', homeTeam: 'A', awayTeam: 'B', gameDate: '2026-10-02T00:15:00Z', homeProbability: 0.6, selection: 'home', selectionPrice: 1.9 });
+    ledger.reconcile('nfl', [{ id: '9', completed: true, date: '2026-10-02T00:15:00Z', home: { score: 21 }, away: { score: 17 } }]);
+    const local = auditReport(file, { timeZone: 'America/New_York' });
+    assert.equal(local.history[0].gameDate, '2026-10-02T00:15:00.000Z');
+    assert.deepEqual(local.calendar, { timeZone: 'America/New_York', days: [{ date: '2026-10-01', wins: 1, losses: 0, pushes: 0, settled: 1, decided: 1, fraction: '1/1', winRate: 1 }] });
+    assert.equal(auditReport(file, { timeZone: 'Not/AZone' }).calendar.timeZone, 'UTC');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
