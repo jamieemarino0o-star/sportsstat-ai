@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createTelegramNotifier, sendTelegramMessage, newBetMessageFromEntry, resultMessageFromEntry, expectedValuePercent } from '../src/notifier.js';
+import { createTelegramNotifier, sendTelegramMessage, newBetMessageFromEntry, resultMessageFromEntry, expectedValuePercent, formatNotificationTime } from '../src/notifier.js';
 import { createLedger } from '../src/ledger.js';
 
 const fakeFetch = (calls, { ok = true, status = 200, body = { ok: true } } = {}) => async (url, init) => {
@@ -8,15 +8,32 @@ const fakeFetch = (calls, { ok = true, status = 200, body = { ok: true } } = {})
   return { ok, status, json: async () => body };
 };
 
-const pick = { sport: 'nfl', eventId: '1', homeTeam: 'Buffalo Bills', awayTeam: 'Los Angeles Chargers', homeProbability: 0.6, selection: 'home', selectionPrice: 1.9 };
+const pick = { sport: 'nfl', eventId: '1', homeTeam: 'Buffalo Bills', awayTeam: 'Los Angeles Chargers', homeProbability: 0.6, selection: 'home', selectionPrice: 1.9, gameDate: '2026-10-02T00:15:00Z', updatedAt: '2026-10-01T14:00:00Z', resolvedAt: '2026-10-02T03:30:00Z' };
 
 test('message formats match the required templates', () => {
-  assert.equal(newBetMessageFromEntry(pick), '🚀 New Bet Detected!\nMatch: Los Angeles Chargers @ Buffalo Bills\nPick: Buffalo Bills\nOdds: 1.90\nEV: +14.0%');
+  assert.equal(newBetMessageFromEntry(pick), '🚀 New Bet Detected!\nMatch: Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 2, 2026, 12:15 AM UTC\nDetected: Oct 1, 2026, 2:00 PM UTC\nPick: Buffalo Bills\nOdds: 1.90\nEV: +14.0%');
   assert.ok(Math.abs(expectedValuePercent({ ...pick, selection: 'away', selectionPrice: 2 }) - -20) < 1e-9);
   const won = resultMessageFromEntry({ ...pick, resolved: true, homeScore: 24, awayScore: 16 });
-  assert.equal(won, '🏁 Final Result - Los Angeles Chargers @ Buffalo Bills\nWinner: Buffalo Bills\nStatus: ✅ Won (Final 16-24)');
+  assert.equal(won, '🏁 Final Result - Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 2, 2026, 12:15 AM UTC\nSettled: Oct 2, 2026, 3:30 AM UTC\nWinner: Buffalo Bills\nStatus: ✅ Won (Final 16-24)');
   assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 10, awayScore: 20 }), /Winner: Los Angeles Chargers\nStatus: ❌ Lost/);
   assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 1, awayScore: 1 }), /Winner: Draw\nStatus: Push/);
+});
+
+test('notification timestamps handle local date boundaries, DST and missing dates', () => {
+  assert.match(newBetMessageFromEntry(pick, { timeZone: 'America/New_York' }), /Game time: Oct 1, 2026, 8:15 PM EDT/);
+  assert.match(resultMessageFromEntry({ ...pick, homeScore: 24, awayScore: 16 }, { timeZone: 'America/New_York' }), /Settled: Oct 1, 2026, 11:30 PM EDT/);
+  assert.equal(formatNotificationTime('2026-12-02T00:15:00Z', 'America/New_York'), 'Dec 1, 2026, 7:15 PM EST');
+  for (const value of [undefined, null, '', 'not-a-date']) assert.equal(formatNotificationTime(value), 'Not available');
+  assert.match(newBetMessageFromEntry({ ...pick, gameDate: null, updatedAt: null, loggedAt: '2026-10-01T14:00:00Z' }), /Game time: Not available\nDetected: Oct 1, 2026, 2:00 PM UTC/);
+  assert.throws(() => createTelegramNotifier({ timeZone: 'Invalid/Zone' }), RangeError);
+});
+
+test('notifier applies configured time zone to both notification types', async () => {
+  const calls = [];
+  const notifier = createTelegramNotifier({ token: 't', chatId: 'c', minEv: null, fetcher: fakeFetch(calls), gapMs: 0, timeZone: 'America/New_York' });
+  await notifier.notifyNewBet(pick);
+  await notifier.notifyResult({ ...pick, resolved: true, homeScore: 24, awayScore: 16 });
+  assert.ok(calls.every((call) => call.body.text.includes('Game time: Oct 1, 2026, 8:15 PM EDT')));
 });
 
 test('sender skips without credentials and reports API errors without throwing', async () => {

@@ -160,9 +160,9 @@ export function impliedProbability(decimalOdds) {
   return Number.isFinite(decimalOdds) && decimalOdds > 1 ? 1 / decimalOdds : null;
 }
 
-export function americanOdds(decimalOdds) {
+export function formatDecimalOdds(decimalOdds) {
   if (!Number.isFinite(decimalOdds) || decimalOdds <= 1) return '--';
-  return decimalOdds >= 2 ? `+${Math.round((decimalOdds - 1) * 100)}` : String(Math.round(-100 / (decimalOdds - 1)));
+  return decimalOdds.toFixed(2);
 }
 
 export function matchOdds(game, events) {

@@ -1,3 +1,5 @@
+import { formatDecimalOdds } from '../public/js/model.js';
+
 // Telegram notifications for new model picks and final results. Uses Node's built-in fetch, so no
 // extra dependency is needed. Every send is fire-and-forget: a Telegram outage, bad token or rate
 // limit is logged (without the token) and never propagates into the prediction/ledger pipeline.
@@ -19,25 +21,35 @@ export function expectedValuePercent(entry) {
   return (pickProbability(entry) * entry.selectionPrice - 1) * 100;
 }
 
-export function formatNewBetMessage({ match, pick, odds, ev }) {
-  return `🚀 New Bet Detected!\nMatch: ${match}\nPick: ${pick}\nOdds: ${odds}\nEV: ${ev}%`;
+export function formatNotificationTime(value, timeZone = 'UTC') {
+  if (!value || Number.isNaN(Date.parse(value))) return 'Not available';
+  return new Intl.DateTimeFormat('en-US', {
+    timeZone, month: 'short', day: 'numeric', year: 'numeric',
+    hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+  }).format(new Date(value));
 }
 
-export function formatResultMessage({ match, winner, status }) {
-  return `🏁 Final Result - ${match}\nWinner: ${winner}\nStatus: ${status}`;
+export function formatNewBetMessage({ match, pick, odds, ev, gameTime = 'Not available', detectedAt = 'Not available' }) {
+  return `🚀 New Bet Detected!\nMatch: ${match}\nGame time: ${gameTime}\nDetected: ${detectedAt}\nPick: ${pick}\nOdds: ${odds}\nEV: ${ev}%`;
 }
 
-export function newBetMessageFromEntry(entry) {
+export function formatResultMessage({ match, winner, status, gameTime = 'Not available', settledAt = 'Not available' }) {
+  return `🏁 Final Result - ${match}\nGame time: ${gameTime}\nSettled: ${settledAt}\nWinner: ${winner}\nStatus: ${status}`;
+}
+
+export function newBetMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
   const ev = expectedValuePercent(entry);
   return formatNewBetMessage({
     match: matchLabel(entry),
     pick: pickTeam(entry) || 'n/a',
-    odds: Number.isFinite(entry.selectionPrice) ? entry.selectionPrice.toFixed(2) : 'n/a',
+    odds: Number.isFinite(entry.selectionPrice) && entry.selectionPrice > 1 ? formatDecimalOdds(entry.selectionPrice) : 'n/a',
     ev: ev === null ? 'n/a' : `${ev >= 0 ? '+' : ''}${ev.toFixed(1)}`,
+    gameTime: formatNotificationTime(entry.gameDate, timeZone),
+    detectedAt: formatNotificationTime(entry.updatedAt || entry.loggedAt, timeZone),
   });
 }
 
-export function resultMessageFromEntry(entry) {
+export function resultMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
   const draw = entry.homeScore === entry.awayScore;
   const winner = draw ? 'Draw' : entry.homeScore > entry.awayScore ? entry.homeTeam : entry.awayTeam;
   const score = `Final ${entry.awayScore}-${entry.homeScore}`;
@@ -45,7 +57,11 @@ export function resultMessageFromEntry(entry) {
   if (!entry.selection) status = `No pick (${score})`;
   else if (draw) status = `Push (${score})`;
   else status = `${winner === pickTeam(entry) ? '✅ Won' : '❌ Lost'} (${score})`;
-  return formatResultMessage({ match: matchLabel(entry), winner: winner || 'n/a', status });
+  return formatResultMessage({
+    match: matchLabel(entry), winner: winner || 'n/a', status,
+    gameTime: formatNotificationTime(entry.gameDate, timeZone),
+    settledAt: formatNotificationTime(entry.resolvedAt, timeZone),
+  });
 }
 
 // Low-level sender. Returns { ok, skipped?, error? } instead of throwing.
@@ -79,7 +95,10 @@ export function createTelegramNotifier({
   fetcher = fetch,
   gapMs = MIN_SEND_GAP_MS,
   logger = console,
+  timeZone = process.env.TELEGRAM_TIME_ZONE || 'UTC',
 } = {}) {
+  // Reject a bad configuration at startup rather than dropping notifications later.
+  new Intl.DateTimeFormat('en-US', { timeZone });
   const enabled = Boolean(token && chatId);
   let queue = Promise.resolve();
 
@@ -108,11 +127,11 @@ export function createTelegramNotifier({
       if (!entry?.selection || !Number.isFinite(entry.selectionPrice)) return Promise.resolve({ ok: false, skipped: true });
       const ev = expectedValuePercent(entry);
       if (Number.isFinite(minEv) && (ev === null || ev < minEv)) return Promise.resolve({ ok: false, skipped: true });
-      return enqueue(newBetMessageFromEntry(entry));
+      return enqueue(newBetMessageFromEntry(entry, { timeZone }));
     },
     notifyResult(entry) {
       if (!entry?.resolved || !Number.isFinite(entry.homeScore) || !Number.isFinite(entry.awayScore)) return Promise.resolve({ ok: false, skipped: true });
-      return enqueue(resultMessageFromEntry(entry));
+      return enqueue(resultMessageFromEntry(entry, { timeZone }));
     },
     // Resolves once every queued message has been attempted (useful for tests and CLI scripts).
     flush: () => queue,

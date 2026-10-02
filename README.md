@@ -35,6 +35,8 @@ Set `ODDS_API_KEY` in `.env`, then restart Node. Never put the key in frontend c
 
 Without a key, live scores and historical analysis still work, but actual sportsbook markets remain unavailable.
 
+All sportsbook quotes are displayed in decimal odds (for example, `1.91` or `2.50`), including signal tables, sportsbook comparisons, line movement, bet slips, Telegram alerts and audit/backtest odds brackets. EV, probability and staking calculations continue to use the original unrounded decimal prices.
+
 ## Telegram Notifications
 
 `src/notifier.js` sends a Telegram message whenever the prediction ledger logs a new priced pick and when that game is reconciled as final. Create a bot with [@BotFather](https://t.me/BotFather), message it once, then set in `.env`:
@@ -42,10 +44,11 @@ Without a key, live scores and historical analysis still work, but actual sports
 ```sh
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=123456789
+TELEGRAM_TIME_ZONE=America/New_York  # optional IANA time zone; default UTC
 TELEGRAM_MIN_EV=3   # optional: only announce picks with EV >= 3%
 ```
 
-Restart Node and run `npm run telegram:test` to confirm delivery. A pick is announced once per event (again only if the model flips sides), not on every refresh; results are announced once on reconciliation. Sends are queued about one per second, and failures are logged without the token and never affect the ledger. Without both variables, notifications are disabled.
+Restart Node and run `npm run telegram:test` to confirm delivery. New-bet messages include the scheduled game date/time and detection date/time; result messages include the scheduled game date/time and settlement date/time (when the server reconciles the result, not necessarily the final whistle). Times include a time-zone label and respect daylight saving time. Older records without a game date show "Not available". An invalid `TELEGRAM_TIME_ZONE` is rejected at startup. A pick is announced once per event, including across side flips, not on every refresh; results are announced once on reconciliation. Sends are queued about one per second, and failures are logged without the token and never affect the ledger. Without both credential variables, notifications are disabled.
 
 ## Workspace
 
@@ -159,7 +162,7 @@ Every prediction the browser posts also carries `selectionPrice` — the decimal
 A single blended ROI can hide a losing slice inside a winning total, so every run also reports the same headline metrics (sample size, ROI, Brier score, average CLV) sliced three ways:
 
 - **By risk tier** (`low`/`medium`/`high`, matching the live app's `classifyRisk()`) — exposes whether "low risk" short-priced favorites are actually a slow bleed once the vig is priced in, since a flat proportional margin taxes short favorites the hardest.
-- **By odds bracket**, labeled in bettor-recognizable American odds bands (heavy favorite, favorite, even money, underdog, mid underdog, longshot) — shows whether the edge lives in dogs, favorites, or is spread evenly.
+- **By odds bracket**, labeled in decimal odds bands (heavy favorite, favorite, even money, underdog, mid underdog, longshot) — shows whether the edge lives in dogs, favorites, or is spread evenly.
 - **By sport** — surfaces a sport whose model is quietly losing money that a blended total across sports would otherwise mask.
 
 Empty slices are still listed (as "no resolved trials yet") so a thin sample isn't mistaken for "no data."

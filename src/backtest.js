@@ -199,32 +199,20 @@ export function recommendKellyFraction(grid, { maxDrawdownCap = 0.4 } = {}) {
   return pool.reduce((best, entry) => (entry.endingBankroll > best.endingBankroll ? entry : best), pool[0]).fraction;
 }
 
-// Converts decimal odds to American odds purely for labeling buckets in bettor-familiar terms
-// (e.g. "+150 to +300"); all staking math elsewhere continues to use decimal odds.
-function decimalToAmerican(decimalOdds) {
-  return decimalOdds >= 2 ? (decimalOdds - 1) * 100 : -100 / (decimalOdds - 1);
-}
-
-// Odds brackets, expressed in American odds for readability: sportsbooks typically overround
-// short favorites the hardest (a flat vig eats a much bigger share of a -300 favorite's edge than
-// a +250 underdog's), so grouping by bracket exposes whether "safe" short-priced bets are actually
-// a slow bleed once the vig is accounted for, versus where the model's real edge lives.
+// Decimal thresholds preserve the original portfolio buckets without rounding prices first.
 const ODDS_BRACKETS = [
-  { key: 'favorite_heavy', label: 'Favorite (-200 or shorter)', max: -200 },
-  { key: 'favorite', label: 'Favorite (-199 to -110)', max: -110 },
-  { key: 'even_money', label: 'Even money (-109 to +109)', max: 109 },
-  { key: 'underdog', label: 'Underdog (+110 to +150)', max: 150 },
-  { key: 'underdog_mid', label: 'Underdog (+151 to +300)', max: 300 },
-  { key: 'longshot', label: 'Longshot (+301 or longer)', max: Infinity },
+  { key: 'favorite_heavy', label: 'Heavy favorite (1.00 < odds <= 1.50)', max: 1.5 },
+  { key: 'favorite', label: 'Favorite (1.50 < odds <= 1.9091)', max: 1 + 100 / 110 },
+  { key: 'even_money', label: 'Even money (1.9091 < odds <= 2.09)', max: 2.09 },
+  { key: 'underdog', label: 'Underdog (2.09 < odds <= 2.50)', max: 2.5 },
+  { key: 'underdog_mid', label: 'Mid underdog (2.50 < odds <= 4.00)', max: 4 },
+  { key: 'longshot', label: 'Longshot (odds > 4.00)', max: Infinity },
 ];
 
 export function oddsBracket(decimalOdds) {
   if (!Number.isFinite(decimalOdds) || decimalOdds <= 1) return null;
-  const american = decimalToAmerican(decimalOdds);
-  // Favorites (negative American odds) get more negative as they shorten, so the natural bracket
-  // order runs -200 -> -110 -> even money -> +150 -> +300 -> longshot; walk brackets in that order.
   for (const bracket of ODDS_BRACKETS) {
-    if (american <= bracket.max) return bracket;
+    if (decimalOdds <= bracket.max) return bracket;
   }
   return ODDS_BRACKETS.at(-1);
 }
@@ -265,7 +253,7 @@ export function stratifyByRiskTier(trials) {
   return stratify(trials, (trial) => classifyRisk(trial.modelProbability, trial.openingPrice)?.tier ?? null, ['low', 'medium', 'high']);
 }
 
-// Slice 2: odds bracket, in American-odds terms bettors recognize, so profitability by price range
+// Slice 2: decimal odds bracket, so profitability by price range
 // (heavy favorites through longshots) is visible independent of the model's own risk tier.
 export function stratifyByOddsBracket(trials) {
   return stratify(trials, (trial) => oddsBracket(trial.openingPrice), ODDS_BRACKETS.map((bracket) => bracket.key)).map((bucket) => ({

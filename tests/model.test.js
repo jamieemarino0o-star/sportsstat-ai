@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { normalizeEvent, historicalTrend, predictGame, expectedValue, impliedProbability, americanOdds, matchOdds } from '../public/js/model.js';
+import { normalizeEvent, historicalTrend, predictGame, expectedValue, impliedProbability, formatDecimalOdds, matchOdds } from '../public/js/model.js';
 
 const game = { id: '1', date: '2026-09-27T20:00:00Z', home: { id: 'a', name: 'Boston Celtics', score: 110 }, away: { id: 'b', name: 'New York Knicks', score: 99 }, completed: true };
 const history = Array.from({ length: 10 }, (_, index) => ({ ...game, id: String(index), date: `2026-09-${String(index + 1).padStart(2, '0')}T20:00:00Z` }));
@@ -107,11 +107,15 @@ test('predictions require both team samples and never predict completed games', 
   assert.ok(prediction.probability > 0.5 && prediction.probability < 1);
 });
 
-test('decimal odds yield correct EV, implied probability, and American prices', () => {
+test('decimal odds yield correct EV, implied probability, and decimal display prices', () => {
   assert.ok(Math.abs(expectedValue(0.6, 1.9) - 14) < 1e-10);
   assert.equal(impliedProbability(2), 0.5);
-  assert.equal(americanOdds(2.5), '+150');
-  assert.equal(americanOdds(1.5), '-200');
+  assert.equal(formatDecimalOdds(2.5), '2.50');
+  assert.equal(formatDecimalOdds(1.5), '1.50');
+  assert.equal(formatDecimalOdds(1.9091), '1.91');
+  for (const invalid of [null, undefined, NaN, Infinity, 1, -200, '2.5']) {
+    assert.equal(formatDecimalOdds(invalid), '--');
+  }
   assert.equal(expectedValue(null, 2), null);
   assert.equal(expectedValue(1.1, 2), null);
   assert.equal(expectedValue(0.6, 1), null);

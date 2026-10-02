@@ -123,15 +123,20 @@ test('backtestFile reads an on-disk ledger written by the live ledger module end
   }
 });
 
-test('oddsBracket labels decimal prices in bettor-recognizable American odds bands', () => {
-  assert.equal(oddsBracket(1.5).key, 'favorite_heavy'); // shorter than -200
-  assert.equal(oddsBracket(1.67).key, 'favorite'); // ~-149
-  assert.equal(oddsBracket(1.95).key, 'even_money'); // ~-105
-  assert.equal(oddsBracket(2.09).key, 'even_money'); // ~+109, still even money
-  assert.equal(oddsBracket(2.1).key, 'underdog'); // +110
-  assert.equal(oddsBracket(2.5).key, 'underdog'); // +150
-  assert.equal(oddsBracket(3.5).key, 'underdog_mid'); // +250
-  assert.equal(oddsBracket(5).key, 'longshot'); // +400
+test('oddsBracket uses decimal bands without changing classification boundaries', () => {
+  assert.equal(oddsBracket(1.5).key, 'favorite_heavy');
+  assert.equal(oddsBracket(1.67).key, 'favorite');
+  assert.equal(oddsBracket(1 + 100 / 110).key, 'favorite');
+  assert.equal(oddsBracket(1.91).key, 'even_money');
+  assert.equal(oddsBracket(1.95).key, 'even_money');
+  assert.equal(oddsBracket(2.09).key, 'even_money');
+  assert.equal(oddsBracket(2.1).key, 'underdog');
+  assert.equal(oddsBracket(2.5).key, 'underdog');
+  assert.equal(oddsBracket(3.5).key, 'underdog_mid');
+  assert.equal(oddsBracket(4).key, 'underdog_mid');
+  assert.equal(oddsBracket(4.01).key, 'longshot');
+  assert.equal(oddsBracket(5).key, 'longshot');
+  assert.equal(oddsBracket(2.5).label, 'Underdog (2.09 < odds <= 2.50)');
   assert.equal(oddsBracket(null), null);
   assert.equal(oddsBracket(1), null);
 });
