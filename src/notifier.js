@@ -1,4 +1,8 @@
 import { formatDecimalOdds } from '../public/js/model.js';
+import { createNotificationOutbox } from './notification-outbox.js';
+import { readFileSync } from 'node:fs';
+import { parseLedgerLines } from './backtest.js';
+import { buildLedgerRows, buildWinCalendar, dayKey } from './audit.js';
 
 // Telegram notifications for new model picks and final results. Uses Node's built-in fetch, so no
 // extra dependency is needed. Every send is fire-and-forget: a Telegram outage, bad token or rate
@@ -9,11 +13,13 @@ const SEND_TIMEOUT_MS = 10000;
 // Telegram allows roughly one message per second to a single chat; space sends so a scoreboard
 // refresh that resolves many games at once doesn't trigger 429s.
 const MIN_SEND_GAP_MS = 1100;
-const MAX_QUEUE = 100;
 
 const matchLabel = (entry) => `${entry.awayTeam || 'Away'} @ ${entry.homeTeam || 'Home'}`;
 const pickTeam = (entry) => (entry.selection === 'home' ? entry.homeTeam : entry.selection === 'away' ? entry.awayTeam : null);
 const pickProbability = (entry) => (entry.selection === 'home' ? entry.homeProbability : 1 - entry.homeProbability);
+const probabilityLabel = (entry) => ['home', 'away'].includes(entry.selection)
+  && Number.isFinite(entry.homeProbability) && entry.homeProbability >= 0 && entry.homeProbability <= 1
+  ? `${(pickProbability(entry) * 100).toFixed(1)}%` : 'Not available';
 
 // Expected value (in %) of a 1-unit stake on the model's pick at the matched decimal odds.
 export function expectedValuePercent(entry) {
@@ -29,12 +35,12 @@ export function formatNotificationTime(value, timeZone = 'UTC') {
   }).format(new Date(value));
 }
 
-export function formatNewBetMessage({ match, pick, odds, ev, gameTime = 'Not available', detectedAt = 'Not available' }) {
-  return `🚀 New Bet Detected!\nMatch: ${match}\nGame time: ${gameTime}\nDetected: ${detectedAt}\nPick: ${pick}\nOdds: ${odds}\nEV: ${ev}%`;
+export function formatNewBetMessage({ match, pick, odds, ev, probability = 'Not available', gameTime = 'Not available' }) {
+  return `🚀 New Bet Detected!\nMatch: ${match}\nGame time: ${gameTime}\nPick: ${pick}\nModel pick probability: ${probability}\nOdds: ${odds}\nEV: ${ev}%`;
 }
 
-export function formatResultMessage({ match, winner, status, gameTime = 'Not available', settledAt = 'Not available' }) {
-  return `🏁 Final Result - ${match}\nGame time: ${gameTime}\nSettled: ${settledAt}\nWinner: ${winner}\nStatus: ${status}`;
+export function formatResultMessage({ match, winner, status, probability = 'Not available', gameTime = 'Not available', settledAt = 'Not available' }) {
+  return `🏁 Final Result - ${match}\nGame time: ${gameTime}\nSettled: ${settledAt}\nModel pick probability: ${probability}\nWinner: ${winner}\nStatus: ${status}`;
 }
 
 export function newBetMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
@@ -45,7 +51,7 @@ export function newBetMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
     odds: Number.isFinite(entry.selectionPrice) && entry.selectionPrice > 1 ? formatDecimalOdds(entry.selectionPrice) : 'n/a',
     ev: ev === null ? 'n/a' : `${ev >= 0 ? '+' : ''}${ev.toFixed(1)}`,
     gameTime: formatNotificationTime(entry.gameDate, timeZone),
-    detectedAt: formatNotificationTime(entry.updatedAt || entry.loggedAt, timeZone),
+    probability: probabilityLabel(entry),
   });
 }
 
@@ -61,6 +67,7 @@ export function resultMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
     match: matchLabel(entry), winner: winner || 'n/a', status,
     gameTime: formatNotificationTime(entry.gameDate, timeZone),
     settledAt: formatNotificationTime(entry.resolvedAt, timeZone),
+    probability: probabilityLabel(entry),
   });
 }
 
@@ -76,9 +83,16 @@ export async function sendTelegramMessage(text, { token = process.env.TELEGRAM_B
     });
     if (!response.ok) {
       let description = `HTTP ${response.status}`;
-      try { description = (await response.json()).description || description; } catch { /* non-JSON error body */ }
-      return { ok: false, error: description };
+      let retryAfterMs = 0;
+      try {
+        const body = await response.json();
+        description = body.description || description;
+        if (Number.isFinite(body.parameters?.retry_after)) retryAfterMs = body.parameters.retry_after * 1000;
+      } catch { /* non-JSON error body */ }
+      return { ok: false, error: description, ...(retryAfterMs > 0 ? { retryAfterMs } : {}) };
     }
+    const body = await response.json();
+    if (body.ok !== true) return { ok: false, error: 'Telegram did not acknowledge the message' };
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error.name === 'TimeoutError' ? 'request timed out' : error.message };
@@ -96,46 +110,64 @@ export function createTelegramNotifier({
   gapMs = MIN_SEND_GAP_MS,
   logger = console,
   timeZone = process.env.TELEGRAM_TIME_ZONE || 'UTC',
+  file = null,
+  retryMs = 5000,
+  now = Date.now,
+  schedule = true,
+  outboxState = null,
+  persistOutbox = null,
 } = {}) {
   // Reject a bad configuration at startup rather than dropping notifications later.
   new Intl.DateTimeFormat('en-US', { timeZone });
   const enabled = Boolean(token && chatId);
-  let queue = Promise.resolve();
+  const outbox = createNotificationOutbox({
+    file, gapMs, retryMs, now, logger, schedule, initialState: outboxState, saveState: persistOutbox,
+    send: (text) => sendTelegramMessage(text, { token, chatId, fetcher }),
+  });
 
-  let queued = 0;
-  function enqueue(text) {
-    if (!enabled) return Promise.resolve({ ok: false, skipped: true });
-    // Bound the backlog so a long Telegram outage can't grow memory without limit.
-    if (queued >= MAX_QUEUE) {
-      logger.warn?.('[telegram] queue full, dropping notification');
-      return Promise.resolve({ ok: false, skipped: true, error: 'queue full' });
-    }
-    queued += 1;
-    const job = queue.then(async () => {
-      const result = await sendTelegramMessage(text, { token, chatId, fetcher });
-      if (!result.ok && !result.skipped) logger.warn?.(`[telegram] notification failed: ${result.error}`);
-      if (gapMs > 0) await new Promise((resolve) => setTimeout(resolve, gapMs));
-      return result;
-    }).finally(() => { queued -= 1; });
-    queue = job.catch(() => {});
-    return job;
-  }
-
-  return {
+  const notifier = {
     enabled,
     notifyNewBet(entry) {
       if (!entry?.selection || !Number.isFinite(entry.selectionPrice)) return Promise.resolve({ ok: false, skipped: true });
       const ev = expectedValuePercent(entry);
       if (Number.isFinite(minEv) && (ev === null || ev < minEv)) return Promise.resolve({ ok: false, skipped: true });
-      return enqueue(newBetMessageFromEntry(entry, { timeZone }));
+      if (!enabled) return Promise.resolve({ ok: false, skipped: true });
+      return outbox.enqueue(`bet:${entry.sport}:${entry.eventId}`, newBetMessageFromEntry(entry, { timeZone }));
     },
     notifyResult(entry) {
       if (!entry?.resolved || !Number.isFinite(entry.homeScore) || !Number.isFinite(entry.awayScore)) return Promise.resolve({ ok: false, skipped: true });
-      return enqueue(resultMessageFromEntry(entry, { timeZone }));
+      if (!enabled) return Promise.resolve({ ok: false, skipped: true });
+      return outbox.enqueue(`result:${entry.sport}:${entry.eventId}`, resultMessageFromEntry(entry, { timeZone }));
     },
-    // Resolves once every queued message has been attempted (useful for tests and CLI scripts).
-    flush: () => queue,
+    async syncLedger(ledgerFile) {
+      if (!enabled) return;
+      await outbox.flush();
+      let raw;
+      try { raw = Array.isArray(ledgerFile) ? ledgerFile.map((record) => JSON.stringify(record)).join('\n') : readFileSync(ledgerFile, 'utf8'); }
+      catch (error) { if (error.code === 'ENOENT') return; throw error; }
+      const groups = parseLedgerLines(raw.split('\n'));
+      for (const group of groups.values()) {
+        const announced = group.predictions.find((entry) => entry.announced && entry.selection && entry.selectionPrice > 1);
+        if (announced) await notifier.notifyNewBet(announced);
+        if (group.result && group.predictions.length) {
+          await notifier.notifyResult({ ...group.predictions.at(-1), ...group.result });
+        }
+      }
+      const rows = buildLedgerRows(groups, { limit: Infinity });
+      const today = dayKey(new Date(now()).toISOString(), timeZone);
+      const days = buildWinCalendar(rows, { timeZone });
+      for (const day of days) {
+        if (day.date >= today || rows.some((row) => dayKey(row.gameDate || row.resolvedAt || row.loggedAt, timeZone) === day.date && !row.resolved)) continue;
+        const rate = day.decided ? `${(day.winRate * 100).toFixed(1)}%` : 'Not available (pushes only)';
+        await outbox.enqueue(`day:${timeZone}:${day.date}`,
+          `📊 Daily Closing Results\nDate: ${day.date} (${timeZone})\nWins: ${day.fraction}\nWin rate: ${rate}\nLosses: ${day.losses}\nPushes: ${day.pushes}\nAll tracked games settled.`);
+      }
+    },
+    flush: () => enabled ? outbox.flush() : Promise.resolve(),
+    pendingCount: outbox.pendingCount,
+    close: outbox.close,
   };
+  return notifier;
 }
 
 if (process.argv[1] && process.argv[1].endsWith('notifier.js')) {

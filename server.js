@@ -9,6 +9,7 @@ import { createLedger } from './src/ledger.js';
 import { createTelegramNotifier } from './src/notifier.js';
 import { auditReport, isValidTimeZone } from './src/audit.js';
 import { SPORT_MARKETS } from './public/js/markets.js';
+import { createHistoryStore, readLocalRecords } from './src/history-store.js';
 
 const OPTIMIZED_PARAMS_FILE = fileURLToPath(new URL('./data/optimized-params.json', import.meta.url));
 const LEDGER_FILE = fileURLToPath(new URL('./data/predictions.jsonl', import.meta.url));
@@ -21,7 +22,7 @@ function readOptimizedParams() {
   try { return JSON.parse(readFileSync(OPTIMIZED_PARAMS_FILE, 'utf8')); } catch { return { generatedAt: null, sports: {} }; }
 }
 
-export function createApp(feeds = createFeeds()) {
+export function createApp(feeds = createFeeds(), { historyStore = null } = {}) {
   const app = express();
   app.disable('x-powered-by');
   // Behind a reverse proxy (e.g. Render), set TRUST_PROXY=1 so rate limiting keys on the real client
@@ -45,8 +46,14 @@ export function createApp(feeds = createFeeds()) {
   app.use('/api', rateLimit({ windowMs: 60000, limit: 150, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many requests. Please try again in a minute.' } }));
   app.use('/api/predictions', express.json({ limit: '4kb', strict: true }));
   // Ledger-derived payloads must never be cached by browsers or intermediaries.
-  app.use(['/api/audit', '/api/optimized-params'], (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+  app.use(['/api/audit', '/api/optimized-params', '/api/storage', '/api/ledger/export'], (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   app.get('/api/status', (req, res) => res.json(feeds.status()));
+  const storageStatus = () => historyStore?.status() || { backend: 'local', durable: false, error: null };
+  app.get('/api/storage', (req, res) => res.json(storageStatus()));
+  app.get('/api/ledger/export', async (req, res) => {
+    const records = historyStore ? await historyStore.readRecords() : readLocalRecords(LEDGER_FILE);
+    res.attachment('predictions.jsonl').type('application/x-ndjson').send(records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+  });
   app.get('/api/optimized-params', (req, res) => {
     const params = readOptimizedParams();
     if (req.query.sport && Object.hasOwn(SPORTS, req.query.sport)) {
@@ -58,12 +65,13 @@ export function createApp(feeds = createFeeds()) {
   // the sport-validation middleware and only checks ?sport= manually when it is present. Reads the
   // ledger file fresh on every request: it's an append-only log that changes only as games resolve,
   // so there is no server-side caching to invalidate and no risk of a stale audit after a restart.
-  app.get('/api/audit', (req, res) => {
+  app.get('/api/audit', async (req, res) => {
     const sport = req.query.sport && Object.hasOwn(SPORTS, req.query.sport) ? req.query.sport : null;
     const kellyFraction = Number(req.query.kellyFraction);
     // ?tz= is the viewer's IANA time zone so the win calendar buckets games by their local date.
     const timeZone = typeof req.query.tz === 'string' && req.query.tz.length <= 64 && isValidTimeZone(req.query.tz) ? req.query.tz : 'UTC';
-    res.json(auditReport(LEDGER_FILE, { sport, timeZone, kellyFraction: Number.isFinite(kellyFraction) && kellyFraction > 0 && kellyFraction <= 1 ? kellyFraction : 0.25 }));
+    const source = historyStore ? await historyStore.readRecords() : LEDGER_FILE;
+    res.json({ ...auditReport(source, { sport, timeZone, kellyFraction: Number.isFinite(kellyFraction) && kellyFraction > 0 && kellyFraction <= 1 ? kellyFraction : 0.25 }), storage: storageStatus() });
   });
   app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');
@@ -108,6 +116,7 @@ export function createApp(feeds = createFeeds()) {
   app.use('/api', (req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
   app.use(express.static(fileURLToPath(new URL('./public', import.meta.url)), { etag: true, maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0 }));
   app.use((error, req, res, next) => {
+    if (error.code === 'HISTORY_STORAGE_UNAVAILABLE') return res.status(503).json({ error: error.message });
     // Client errors raised by middleware (malformed JSON, oversized body) keep their 4xx status and
     // get a generic message; everything else is an upstream failure whose message feeds.js has
     // already reduced to a safe, secret-free summary.
@@ -120,13 +129,51 @@ export function createApp(feeds = createFeeds()) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const PORT = process.env.PORT || 3000;
-  const notifier = createTelegramNotifier();
-  const server = createApp(createFeeds({ ledger: createLedger({ file: LEDGER_FILE, notifier }) })).listen(PORT, '0.0.0.0', () => {
+  const historyStore = createHistoryStore();
+  const records = historyStore ? await historyStore.readRecords() : [];
+  const notifier = createTelegramNotifier({
+    file: historyStore ? null : fileURLToPath(new URL('./data/telegram-outbox.json', import.meta.url)),
+    outboxState: historyStore ? await historyStore.readOutbox() : null,
+    persistOutbox: historyStore?.saveOutbox,
+  });
+  const ledger = createLedger({ file: historyStore ? null : LEDGER_FILE, records, persist: historyStore?.append, notifier });
+  const feeds = createFeeds({ ledger });
+  let reconciling = false;
+  const reconcilePending = async () => {
+    if (reconciling) return;
+    reconciling = true;
+    try {
+      for (const sport of Object.keys(SPORTS)) {
+        if (!ledger.stats(sport).pending) continue;
+        try { await feeds.scoreboard(sport); }
+        catch { console.error(`[ledger] background reconciliation unavailable for ${sport}; will retry`); }
+      }
+    } finally { reconciling = false; }
+  };
+  void reconcilePending();
+  const reconciliationTimer = setInterval(() => { void reconcilePending(); }, 300000);
+  reconciliationTimer.unref();
+  let syncingNotifications = false;
+  const syncNotifications = async () => {
+    if (syncingNotifications) return;
+    syncingNotifications = true;
+    try { await notifier.syncLedger(historyStore ? historyStore.cachedRecords() : LEDGER_FILE); }
+    catch (error) { console.error(`[telegram] ledger recovery failed (${error.code || error.name})`); }
+    finally { syncingNotifications = false; }
+  };
+  void syncNotifications();
+  const notificationTimer = setInterval(() => { void syncNotifications(); }, 30000);
+  notificationTimer.unref();
+  const server = createApp(feeds, { historyStore }).listen(PORT, '0.0.0.0', () => {
     console.log(`SportsStat AI Predictor running on all interfaces at port ${PORT}`);
+    console.log(`Prediction history: ${historyStore ? 'Supabase (durable)' : 'local file (not cloud-backed)'}`);
     console.log(`Telegram notifications ${notifier.enabled ? 'enabled' : 'disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable)'}`);
   });
   for (const signal of ['SIGTERM', 'SIGINT']) {
     process.on(signal, () => {
+      clearInterval(notificationTimer);
+      clearInterval(reconciliationTimer);
+      notifier.close();
       server.close(() => process.exit(0));
       server.closeAllConnections?.();
       setTimeout(() => process.exit(0), 5000).unref();

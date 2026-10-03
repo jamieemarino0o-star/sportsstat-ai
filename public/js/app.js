@@ -65,14 +65,20 @@ function sosWeightFor(gameId) {
 // (selectionPrice): since this runs on every refresh cycle up to kickoff, the ledger's append-only
 // file naturally captures an opening (first logged) and closing (last logged before the game
 // starts) price per event, which the backtest script (src/backtest.js) uses for ROI and CLV.
-// Best-effort and silent: a logging failure should never affect what the user sees.
+let lastPredictionWarning = 0;
 function postPrediction(game, prediction) {
   if (game.completed || game.state !== 'pre' || !Number.isFinite(prediction.homeProbability)) return;
   const price = bestPrice(game, prediction);
   fetch(`/api/predictions?sport=${state.sport}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ eventId: game.id, homeProbability: prediction.homeProbability, selection: prediction.selection, window: state.window, decay: prediction.provenance?.decay, sosWeight: prediction.provenance?.sosWeight, sample: prediction.sample, selectionPrice: price?.price }),
-  }).catch(() => {});
+  }).then((response) => {
+    if (!response.ok) throw new Error('Prediction was not saved');
+  }).catch(() => {
+    if (Date.now() - lastPredictionWarning < 60000) return;
+    lastPredictionWarning = Date.now();
+    toast('Prediction history was not saved. Check storage status before relying on the audit.');
+  });
 }
 
 function applyPrediction(game, prediction) {

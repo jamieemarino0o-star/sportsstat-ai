@@ -46,6 +46,33 @@ test('proxy validates parameters and hides its implementation header', async (co
   assert.ok(response.headers.get('content-security-policy'));
 });
 
+test('cloud audit and raw export use durable records; storage outages are explicit 503 errors', async (context) => {
+  let fail = false;
+  const records = [
+    { type: 'prediction', sport: 'mlb', eventId: 'cloud', selection: 'home', selectionPrice: 2, homeProbability: 0.6, gameDate: '2026-10-02T18:00:00Z', loggedAt: '2026-10-02T12:00:00Z' },
+    { type: 'result', sport: 'mlb', eventId: 'cloud', resolved: true, outcome: 1, homeScore: 3, awayScore: 1, brier: 0.16, resolvedAt: '2026-10-02T22:00:00Z' },
+  ];
+  const historyStore = { status: () => ({ backend: 'supabase', durable: true }), readRecords: async () => {
+    if (fail) throw Object.assign(new Error('History storage unavailable'), { code: 'HISTORY_STORAGE_UNAVAILABLE' });
+    return records;
+  } };
+  const server = createApp({}, { historyStore }).listen(0, '127.0.0.1');
+  context.after(() => new Promise((resolve) => server.close(resolve)));
+  await new Promise((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const report = await (await fetch(`${base}/api/audit`)).json();
+  assert.equal(report.sample, 1);
+  assert.equal(report.calendar.days[0].fraction, '1/1');
+  assert.equal(report.storage.backend, 'supabase');
+  const exported = await fetch(`${base}/api/ledger/export`);
+  assert.equal(exported.headers.get('cache-control'), 'no-store');
+  assert.deepEqual((await exported.text()).trim().split('\n').map(JSON.parse), records);
+  fail = true;
+  const response = await fetch(`${base}/api/audit`);
+  assert.equal(response.status, 503);
+  assert.match((await response.json()).error, /storage unavailable/);
+});
+
 test('injury reports normalize team/player details and cache the league endpoint', async () => {
   const urls = [];
   const feeds = createFeeds({ fetcher: async (url) => {

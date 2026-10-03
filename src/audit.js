@@ -2,6 +2,7 @@ import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { readLedgerFile, buildTrials, runBacktest, computeROI, oddsBracket } from './backtest.js';
 import { classifyRisk } from '../public/js/quants.js';
+import { configuredLedgerSource } from './history-store.js';
 
 // The "Quant Audit & Amelioration Lab" builds on top of the existing backtest engine
 // (src/backtest.js) rather than duplicating its ROI/Brier/CLV/drawdown/stratification math. This
@@ -245,5 +246,5 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const args = process.argv.slice(2);
   const sportArg = args.find((arg) => !arg.startsWith('--'));
   const file = fileURLToPath(new URL('../data/predictions.jsonl', import.meta.url));
-  printReport(auditReport(file, { sport: sportArg || null }));
+  printReport(auditReport(await configuredLedgerSource(file), { sport: sportArg || null }));
 }

@@ -21,7 +21,7 @@ No XSS, SSRF, prototype-pollution or secret-exposure issues were found. `ODDS_AP
 7. Decimal prices above 1001 are discarded.
 8. Ledger pruning is linear instead of quadratic.
 9. Malformed or oversized JSON returns 400/413 with a generic message instead of 502.
-10. `Cache-Control: no-store` on `/api/audit` and `/api/optimized-params`; bounded shutdown; unhandled-rejection logging; Telegram queue capped at 100.
+10. `Cache-Control: no-store` on `/api/audit` and `/api/optimized-params`; bounded shutdown; unhandled-rejection logging; Telegram queue initially capped at 100. Superseded on 2026-10-02 by an atomic persistent outbox with retries and ledger recovery, avoiding dropped notifications (requires durable storage and one process per outbox).
 11. Shin's method falls back to multiplicative de-vig for no-margin markets; Audit Lab result column ordered away-home; push-only calendar days show "Push".
 12. Optional `TRUST_PROXY` so rate limiting keys on real client IPs behind a reverse proxy.
 

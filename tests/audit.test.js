@@ -146,3 +146,19 @@ test('auditReport exposes the calendar in the requested time zone and falls back
     assert.equal(auditReport(file, { timeZone: 'Not/AZone' }).calendar.timeZone, 'UTC');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('yesterday stays 3/3 after a cloud restore and 600 new predictions beyond the history display limit', async () => {
+  const records = [];
+  const ledger = createLedger({ persist: async (record) => { records.push(record); } });
+  for (let index = 1; index <= 3; index += 1) {
+    await ledger.record({ sport: 'mlb', eventId: String(index), gameDate: '2026-10-02T18:00:00Z', homeProbability: 0.6, selection: 'home', selectionPrice: 2 });
+    await ledger.reconcile('mlb', [{ id: String(index), completed: true, home: { score: 3 }, away: { score: 1 } }]);
+  }
+  const before = auditReport(records).calendar.days;
+  assert.equal(before[0].fraction, '3/3');
+  const restored = createLedger({ records, persist: async (record) => { records.push(record); } });
+  for (let index = 4; index <= 603; index += 1) await restored.record({ sport: 'mlb', eventId: String(index), gameDate: '2026-10-03T18:00:00Z', homeProbability: 0.6 });
+  const report = auditReport(records);
+  assert.equal(report.history.length, 500);
+  assert.deepEqual(report.calendar.days, before);
+});

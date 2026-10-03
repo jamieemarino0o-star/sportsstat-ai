@@ -157,3 +157,40 @@ test('hardening: persistence failures are logged once, never thrown', () => {
   assert.equal(errors.length, 1);
   assert.doesNotMatch(errors[0], /token|key/i);
 });
+
+test('durable writes are acknowledged before state changes, survive reload, and retry failures', async () => {
+  const records = [];
+  const announced = [];
+  let fail = true;
+  const ledger = createLedger({ records, persist: async (record) => {
+    if (fail) throw new Error('Storage unavailable');
+    records.push(record);
+  }, notifier: { notifyNewBet: (entry) => announced.push(entry.eventId) } });
+  const prediction = { sport: 'mlb', eventId: '1', homeProbability: 0.6, selection: 'home', selectionPrice: 2 };
+  await assert.rejects(ledger.record(prediction), /Storage unavailable/);
+  assert.equal(ledger.size(), 0);
+  assert.deepEqual(announced, []);
+  fail = false;
+  await ledger.record(prediction);
+  assert.deepEqual(announced, ['1']);
+  fail = true;
+  await assert.rejects(ledger.reconcile('mlb', [game('1', 3, 1)]), /Storage unavailable/);
+  assert.equal(ledger.stats('mlb').pending, 1);
+  fail = false;
+  await ledger.reconcile('mlb', [game('1', 3, 1)]);
+  const restarted = createLedger({ records });
+  assert.equal(restarted.stats('mlb').sample, 1);
+  assert.equal(records.length, 2);
+});
+
+test('durable ledger serializes overlapping prediction and result writes', async () => {
+  const records = [];
+  const ledger = createLedger({ persist: async (record) => { records.push(record); } });
+  await Promise.all([
+    ledger.record({ sport: 'mlb', eventId: '1', homeProbability: 0.6, selection: 'home' }),
+    ledger.reconcile('mlb', [game('1', 3, 1)]),
+    ledger.record({ sport: 'mlb', eventId: '1', homeProbability: 0.1, selection: 'away' }),
+  ]);
+  assert.deepEqual(records.map((record) => record.type), ['prediction', 'result']);
+  assert.equal(ledger.stats('mlb').sample, 1);
+});

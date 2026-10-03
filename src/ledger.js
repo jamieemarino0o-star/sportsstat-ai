@@ -21,24 +21,24 @@ function actualOutcome(home, away) {
 // loop need: an immutable record of what was predicted, and an automated reconciliation against
 // the actual outcome (binary result + Brier score) once it is known.
 // `notifier` (optional, e.g. createTelegramNotifier() from src/notifier.js) receives
-// notifyNewBet(entry) the first time an event gets a priced pick (or the pick flips sides) and
+// notifyNewBet(entry) the first time an event gets a priced pick and
 // notifyResult(entry) when that event is reconciled. Notifier failures never affect the ledger.
-export function createLedger({ file = null, notifier = null, logger = console } = {}) {
+export function createLedger({ file = null, notifier = null, logger = console, records = [], persist = null } = {}) {
   const entries = new Map(); // key: `${sport}:${eventId}`
   // A crash or full disk mid-write can leave a final line without its newline; the next append would
   // then be glued onto it and both records lost. Tracked so append() can terminate a torn tail first.
   let needsNewline = false;
   let lastWriteError = null;
   const notify = (method, entry) => {
-    try { notifier?.[method]?.(entry)?.catch?.(() => {}); } catch { /* notifications are best-effort */ }
+    const failed = () => logger.error?.(`[ledger] ${method} failed for ${entry.sport}:${entry.eventId}; ledger recovery will retry`);
+    try { notifier?.[method]?.(entry)?.catch?.(failed); } catch { failed(); }
   };
 
   function load() {
-    if (!file) return;
     let raw = '';
-    try { raw = readFileSync(file, 'utf8'); } catch { return; }
+    if (file) { try { raw = readFileSync(file, 'utf8'); } catch {} }
     needsNewline = raw.length > 0 && !raw.endsWith('\n');
-    for (const line of raw.split('\n')) {
+    for (const line of [...raw.split('\n'), ...records.map((record) => JSON.stringify(record))]) {
       if (!line.trim()) continue;
       let record;
       try { record = JSON.parse(line); } catch { continue; }
@@ -55,6 +55,7 @@ export function createLedger({ file = null, notifier = null, logger = console } 
   }
 
   function append(record) {
+    if (persist) return persist(record);
     if (!file) return;
     try {
       mkdirSync(dirname(file), { recursive: true });
@@ -102,14 +103,18 @@ export function createLedger({ file = null, notifier = null, logger = console } 
     // toggling `selection` through the public POST /api/predictions route spam the Telegram chat.
     const announceNow = Boolean(entry.selection && entry.selectionPrice && !existing?.announced);
     entry.announced = Boolean(existing?.announced || announceNow);
-    entries.set(key, entry);
-    append(entry);
-    if (announceNow) notify('notifyNewBet', entry);
-    return entry;
+    const commit = () => {
+      entries.set(key, entry);
+      if (announceNow) notify('notifyNewBet', entry);
+      return entry;
+    };
+    const saved = append(entry);
+    return persist ? Promise.resolve(saved).then(commit) : commit();
   }
 
   function reconcile(sport, games) {
     const resolvedNow = [];
+    const writes = [];
     for (const game of games || []) {
       if (!game.completed) continue;
       const key = `${sport}:${game.id}`;
@@ -124,11 +129,21 @@ export function createLedger({ file = null, notifier = null, logger = console } 
       const favoriteCorrect = entry.selection ? (entry.selection === 'home' ? homeScore >= awayScore : awayScore >= homeScore) : null;
       const result = { type: 'result', sport, eventId: entry.eventId, gameDate: validDate(game.date) || entry.gameDate || null, resolved: true, homeScore, awayScore, outcome, brier, favoriteCorrect, resolvedAt: new Date().toISOString() };
       const updated = { ...entry, ...result };
-      entries.set(key, updated);
-      append(result);
-      resolvedNow.push(updated);
-      notify('notifyResult', updated);
+      const commit = () => {
+        entries.set(key, updated);
+        resolvedNow.push(updated);
+        notify('notifyResult', updated);
+      };
+      const saved = append(result);
+      if (persist) writes.push(Promise.resolve(saved).then(commit));
+      else commit();
     }
+    if (persist) return Promise.allSettled(writes).then((results) => {
+      const failed = results.find((result) => result.status === 'rejected');
+      if (failed) throw failed.reason;
+      prune();
+      return resolvedNow;
+    });
     prune();
     return resolvedNow;
   }
@@ -193,5 +208,11 @@ export function createLedger({ file = null, notifier = null, logger = console } 
       .slice(0, limit);
   }
 
-  return { record, reconcile, overdue, stats, size: () => entries.size };
+  let pending = Promise.resolve();
+  const serialize = (operation) => (...args) => {
+    const next = pending.then(() => operation(...args));
+    pending = next.catch(() => {});
+    return next;
+  };
+  return { record: persist ? serialize(record) : record, reconcile: persist ? serialize(reconcile) : reconcile, overdue, stats, size: () => entries.size };
 }

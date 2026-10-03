@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { createLedger } from './ledger.js';
 import { readLedgerFile, buildTrials, computeKellyGrid } from './backtest.js';
 import { SPORTS } from './feeds.js';
+import { configuredLedgerSource } from './history-store.js';
 
 // Automated amelioration: combines every self-tuning signal the app can honestly compute today into
 // one canonical config file (data/optimized-params.json) that the live model/backend can read.
@@ -25,7 +26,7 @@ import { SPORTS } from './feeds.js';
 //      in the ledger (model probability, matched price, outcome) -- this script runs a true offline
 //      grid search for it via src/backtest.js's computeKellyGrid.
 export function optimizeSport(file, sport) {
-  const ledgerStats = createLedger({ file }).stats(sport);
+  const ledgerStats = createLedger(Array.isArray(file) ? { records: file } : { file }).stats(sport);
   const trials = buildTrials(readLedgerFile(file), { sport });
   const kelly = computeKellyGrid(trials);
   return {
@@ -69,7 +70,7 @@ function printReport(result) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const ledgerFile = fileURLToPath(new URL('../data/predictions.jsonl', import.meta.url));
   const outFile = fileURLToPath(new URL('../data/optimized-params.json', import.meta.url));
-  const result = writeOptimizedParams(ledgerFile, outFile);
+  const result = writeOptimizedParams(await configuredLedgerSource(ledgerFile), outFile);
   printReport(result);
   console.log(`Wrote ${outFile}`);
 }

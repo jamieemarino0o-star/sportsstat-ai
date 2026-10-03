@@ -48,7 +48,13 @@ TELEGRAM_TIME_ZONE=America/New_York  # optional IANA time zone; default UTC
 TELEGRAM_MIN_EV=3   # optional: only announce picks with EV >= 3%
 ```
 
-Restart Node and run `npm run telegram:test` to confirm delivery. New-bet messages include the scheduled game date/time and detection date/time; result messages include the scheduled game date/time and settlement date/time (when the server reconciles the result, not necessarily the final whistle). Times include a time-zone label and respect daylight saving time. Older records without a game date show "Not available". An invalid `TELEGRAM_TIME_ZONE` is rejected at startup. A pick is announced once per event, including across side flips, not on every refresh; results are announced once on reconciliation. Sends are queued about one per second, and failures are logged without the token and never affect the ledger. Without both credential variables, notifications are disabled.
+Restart Node and run `npm run telegram:test` to confirm delivery. Both bet and result messages include the model's selected-side probability as a percentage. New-bet messages include the scheduled game date/time, without a detection date; result messages include the scheduled game date/time and settlement date/time (when the server reconciles the result, not necessarily the final whistle). The result probability reflects the latest recorded pick, not necessarily the initially announced pick. Times include a time-zone label and respect daylight saving time. Older records without a game date show "Not available". An invalid `TELEGRAM_TIME_ZONE` is rejected at startup. A pick is announced once per event, including across side flips, not on every refresh; results are announced once on reconciliation. Sends are queued about one per second, and failures are logged without the token and never affect the ledger. Without both credential variables, notifications are disabled.
+
+The server persists pending messages and delivery acknowledgements in `data/telegram-outbox.json` (gitignored), using an atomic replace before sending. Network errors, invalid credentials and API failures retain messages for exponential-backoff retries; Telegram's `retry_after` is respected. There is no 100-message drop limit. Keep one process per outbox and provide a persistent disk: committing the prediction ledger does **not** preserve delivery state or newly generated messages on an ephemeral host. Storage failures are logged and the ledger is re-scanned on startup and every 30 seconds to recover missing bet/result enqueue operations. Pending games are checked against ESPN every five minutes even when no browser is open; off-scoreboard reconciliation retains its existing per-sport throttle.
+
+Daily closing messages combine all sports and show wins/decisive picks (e.g. `3/4`), win rate, losses and pushes separately. They use the Audit Lab's **opening pick** and game-date time-zone grouping. A summary is queued only after that local calendar date ends and every tracked event for it has settled; pending or postponed games delay it. No-pick games do not contribute to the fraction. Once delivered, the summary is not revised for predictions imported later.
+
+Delivery is **at least once**, not a 100% or exactly-once guarantee: a timeout or crash after Telegram accepts a message but before acknowledgement is saved can cause a duplicate. A lost disk loses the outbox. On first use of the persistent outbox, existing ledger bet/result notifications and closed-day summaries are recovered; historical alerts can repeat because the former queue did not store delivery acknowledgements. Do not commit the outbox or delete it while notifications are active.
 
 ## Workspace
 
@@ -241,12 +247,55 @@ tests/server.test.js     Proxy and provider-adapter tests
 .env.example             Local configuration template
 ```
 
+## Free Persistent History: Render + Supabase
+
+Git deploys code; it does not save files created while the Render app runs back to the repository. Your Mac's ledger and Render's ledger are different copies. Render Free discards runtime files on redeploy, restart and idle spin-down. A tracked ledger can reappear as its old Git version, without the bets collected since deployment.
+
+Keep the existing Git-connected Render Free web service and use a **Supabase Free** project for history. No paid disk or compute upgrade is required. Supabase's current free allowance is 500 MB of database storage; it can pause after a week of inactivity and does not include automatic backups. Monitor its quotas and make exports. Free hosting is not an always-on or unlimited service.
+
+### One-Time Setup
+
+1. Create a Free project at <https://supabase.com/dashboard>. Run all of [supabase/schema.sql](supabase/schema.sql) in its SQL Editor. The tables have RLS enabled and no browser access; only the backend service role can use them.
+2. In Render's **Environment** settings, add `SUPABASE_URL` (your project's HTTPS URL), `SUPABASE_SECRET_KEY` (the server secret key, not a publishable/anon key), and `TRUST_PROXY=1`. A legacy `SUPABASE_SERVICE_ROLE_KEY` also works instead of the secret key. Keep these values out of Git, chat and browser code. Do not change your existing odds/Telegram settings.
+3. Deploy the updated code through your existing Git integration. The start command remains `npm start`. Startup restores the cloud ledger and Telegram outbox before listening. On Render, missing configuration or an unavailable database stops startup instead of falling back to temporary files.
+4. Open `/api/storage` on your deployed site: it should report `"backend":"supabase"` and `"durable":true`. Audit Lab shows **Supabase - durable history**. Record a real pre-game prediction, then confirm it remains in Audit Lab after a Render restart.
+
+With neither Supabase variable set, local development still uses the local JSONL file. Configuring only one variable is an error. Cloud mode never automatically imports the repository's bundled ledger; do not mistake old Git data or test data for production history.
+
+### Recover and Back Up
+
+Before deploying, preserve any live history still visible. **Export JSON** in Audit Lab saves its report, but that report is not a lossless ledger backup and its history rows are limited. After this update, `/api/ledger/export` downloads the complete raw JSONL ledger. The route has the same shared, unauthenticated visibility as the existing audit endpoint; protect the app with authentication before public use.
+
+To import a surviving raw ledger from your Mac or an old download, set the same Supabase credentials in your local, gitignored `.env`, then run:
+
+```sh
+npm run history:import -- data/predictions.jsonl
+```
+
+Only import records you know came from real predictions. Repeating an import is safe: identical records have deterministic IDs and are not duplicated. Imports add records and never delete cloud history. Restart Render after an import so its calibration and reconciliation index also reloads. Existing bet/result notifications may be replayed on the first cloud migration because the new outbox has no old delivery acknowledgements.
+
+For a complete backup, including all opening/closing snapshots and results:
+
+```sh
+npm run history:export -- data/history-backup-2026-10-03.jsonl
+```
+
+Use a new filename for each backup; the command refuses to overwrite an existing file. Keep another copy outside the app's filesystem. `npm run audit`, `npm run backtest` and `npm run optimize` read Supabase when configured, so local reports can analyze the hosted history. Missing original pre-game records cannot be recreated honestly from final scores alone.
+
+### Runtime Behavior
+
+- Predictions and final results are acknowledged only after a successful database write. Failed results remain pending for reconciliation to retry. Unchanged prediction polls are skipped to conserve database space; changed snapshots are append-only.
+- Database read failures return an explicit error, not an empty calendar. Failed browser saves show a warning. Requests page through all stored records rather than truncating at Supabase's default row cap.
+- Telegram's pending messages and acknowledgements also use Supabase. Delivery remains at least once: a crash after Telegram accepts a message but before acknowledgement can still duplicate it.
+- Run one server instance per ledger/outbox. The model still records predictions when a browser computes them; a sleeping Render service does not generate new picks. Overdue recorded games are reconciled after wake-up. Durable history does not make free compute always-on.
+- Bet Tracker's manually entered personal slips remain browser-local; this change protects the shared prediction ledger used by Audit Lab and backtests.
+
 ## Before Public Production Use
 
 This is a working, production-minded starter, not a certified production betting system. In particular:
 
 - `POST /api/predictions` is unauthenticated, so on a public deployment anyone can write pre-game predictions for scheduled events into the shared ledger and skew its audit/backtest statistics. Put the deployment behind authentication, or move prediction generation server-side, before trusting the ledger. Telegram announces each event at most once to limit alert spam.
-- The ledger is a local file. Hosts with ephemeral disks (including Render without a persistent disk) erase `data/predictions.jsonl` on every deploy or restart: attach a persistent disk or move to a database. Run exactly one server process per ledger file; two processes would each reconcile and notify independently.
+- Configure Supabase for ephemeral hosts as described above. Local-file mode is not durable on Render and is blocked there. Run exactly one server process per ledger/outbox; two processes would each reconcile and notify independently.
 - Behind a reverse proxy, set `TRUST_PROXY=1` so the API rate limit applies per client instead of to the proxy as a whole.
 
 - Confirm ESPN endpoint usage rights and obtain a licensed provider/SLA if needed. ESPN's public APIs are unofficial and can change without notice.

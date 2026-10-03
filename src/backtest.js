@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve } from 'node:path';
 import { classifyRisk, kellyStake } from '../public/js/quants.js';
+import { configuredLedgerSource } from './history-store.js';
 
 // The live ledger (src/ledger.js) keeps an in-memory "latest wins" view of each event for its own
 // bookkeeping, but the underlying JSONL file it writes to is append-only: every prediction snapshot
@@ -29,8 +30,9 @@ export function parseLedgerLines(lines) {
 }
 
 export function readLedgerFile(file) {
+  if (Array.isArray(file)) return parseLedgerLines(file.map((record) => JSON.stringify(record)));
   let raw = '';
-  try { raw = readFileSync(file, 'utf8'); } catch { return new Map(); }
+  try { raw = readFileSync(file, 'utf8'); } catch (error) { if (error.code === 'ENOENT') return new Map(); throw error; }
   return parseLedgerLines(raw.split('\n'));
 }
 
@@ -343,6 +345,6 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   const args = process.argv.slice(2);
   const sportArg = args.find((arg) => !arg.startsWith('--'));
   const file = fileURLToPath(new URL('../data/predictions.jsonl', import.meta.url));
-  const result = backtestFile(file, { sport: sportArg || null });
+  const result = backtestFile(await configuredLedgerSource(file), { sport: sportArg || null });
   printReport(result, { sport: sportArg || null });
 }

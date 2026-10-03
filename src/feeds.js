@@ -114,7 +114,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
       for (const entry of targets) {
         try {
           const { game } = await feeds.summary(sport, entry.eventId, true);
-          if (game?.completed) ledger.reconcile(sport, [game]);
+          if (game?.completed) await ledger.reconcile(sport, [game]);
         } catch { /* try again on the next sweep */ }
       }
     } catch { /* never surface */ }
@@ -128,7 +128,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
     async scoreboard(sport) {
       const result = await espn(sport, 'scoreboard', 20000);
       const games = (result.data.events || []).map((event) => normalizeEvent(event, sport, source(sport, 'scoreboard', result.time))).filter(Boolean);
-      try { ledger.reconcile(sport, games); } catch { /* reconciliation must never break a scoreboard request */ }
+      try { await ledger.reconcile(sport, games); } catch { /* reconciliation must never break a scoreboard request */ }
       void sweepOverdue(sport, games);
       return {
         games,
@@ -143,7 +143,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
       // Pre-game only: an in-play write would log live odds as the "closing" price (corrupting CLV/ROI)
       // and let a pick be revised after kickoff.
       if (!game || game.completed || game.state !== 'pre') return { recorded: false, message: 'Predictions are only accepted for scheduled games that have not started.' };
-      return { recorded: true, entry: ledger.record({ ...entry, sport, homeTeam: game.home.name, awayTeam: game.away.name, gameDate: game.date }) };
+      return { recorded: true, entry: await ledger.record({ ...entry, sport, homeTeam: game.home.name, awayTeam: game.away.name, gameDate: game.date }) };
     },
     predictionStats: (sport) => ledger.stats(sport),
     async injuries(sport) {
