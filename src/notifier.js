@@ -13,6 +13,7 @@ const SEND_TIMEOUT_MS = 10000;
 // Telegram allows roughly one message per second to a single chat; space sends so a scoreboard
 // refresh that resolves many games at once doesn't trigger 429s.
 const MIN_SEND_GAP_MS = 1100;
+export const QUEBEC_TIME_ZONE = 'America/Toronto';
 
 const matchLabel = (entry) => `${entry.awayTeam || 'Away'} @ ${entry.homeTeam || 'Home'}`;
 const pickTeam = (entry) => (entry.selection === 'home' ? entry.homeTeam : entry.selection === 'away' ? entry.awayTeam : null);
@@ -27,7 +28,7 @@ export function expectedValuePercent(entry) {
   return (pickProbability(entry) * entry.selectionPrice - 1) * 100;
 }
 
-export function formatNotificationTime(value, timeZone = 'UTC') {
+export function formatNotificationTime(value, timeZone = QUEBEC_TIME_ZONE) {
   if (!value || Number.isNaN(Date.parse(value))) return 'Not available';
   return new Intl.DateTimeFormat('en-US', {
     timeZone, month: 'short', day: 'numeric', year: 'numeric',
@@ -43,7 +44,7 @@ export function formatResultMessage({ match, winner, status, probability = 'Not 
   return `🏁 Final Result - ${match}\nGame time: ${gameTime}\nSettled: ${settledAt}\nModel pick probability: ${probability}\nWinner: ${winner}\nStatus: ${status}`;
 }
 
-export function newBetMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
+export function newBetMessageFromEntry(entry, { timeZone = QUEBEC_TIME_ZONE } = {}) {
   const ev = expectedValuePercent(entry);
   return formatNewBetMessage({
     match: matchLabel(entry),
@@ -55,7 +56,7 @@ export function newBetMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
   });
 }
 
-export function resultMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
+export function resultMessageFromEntry(entry, { timeZone = QUEBEC_TIME_ZONE } = {}) {
   const draw = entry.homeScore === entry.awayScore;
   const winner = draw ? 'Draw' : entry.homeScore > entry.awayScore ? entry.homeTeam : entry.awayTeam;
   const score = `Final ${entry.awayScore}-${entry.homeScore}`;
@@ -72,7 +73,7 @@ export function resultMessageFromEntry(entry, { timeZone = 'UTC' } = {}) {
 }
 
 // Low-level sender. Returns { ok, skipped?, error? } instead of throwing.
-export async function sendTelegramMessage(text, { token = process.env.TELEGRAM_BOT_TOKEN, chatId = process.env.TELEGRAM_CHAT_ID, fetcher = fetch } = {}) {
+export async function sendTelegramMessage(text, { token = process.env.TELEGRAM_BOT_TOKEN, chatId = process.env.TELEGRAM_CHAT_ID?.trim(), fetcher = fetch } = {}) {
   if (!token || !chatId) return { ok: false, skipped: true };
   try {
     const response = await fetcher(`${TELEGRAM_API}/bot${token}/sendMessage`, {
@@ -104,12 +105,12 @@ export async function sendTelegramMessage(text, { token = process.env.TELEGRAM_B
 // - gapMs: spacing between queued sends.
 export function createTelegramNotifier({
   token = process.env.TELEGRAM_BOT_TOKEN,
-  chatId = process.env.TELEGRAM_CHAT_ID,
+  chatId = process.env.TELEGRAM_CHAT_ID?.trim(),
   minEv = process.env.TELEGRAM_MIN_EV === undefined || process.env.TELEGRAM_MIN_EV === '' ? null : Number(process.env.TELEGRAM_MIN_EV),
   fetcher = fetch,
   gapMs = MIN_SEND_GAP_MS,
   logger = console,
-  timeZone = process.env.TELEGRAM_TIME_ZONE || 'UTC',
+  timeZone = QUEBEC_TIME_ZONE,
   file = null,
   retryMs = 5000,
   now = Date.now,
@@ -156,7 +157,11 @@ export function createTelegramNotifier({
       const rows = buildLedgerRows(groups, { limit: Infinity });
       const today = dayKey(new Date(now()).toISOString(), timeZone);
       const days = buildWinCalendar(rows, { timeZone });
+      const known = outbox.knownIds();
+      // Dates already summarized under a previous time zone must not be replayed in the new one.
+      const previousZoneDate = known.filter((id) => id.startsWith('day:') && !id.startsWith(`day:${timeZone}:`)).map((id) => id.slice(-10)).sort().at(-1) || '';
       for (const day of days) {
+        if (day.date <= previousZoneDate) continue;
         if (day.date >= today || rows.some((row) => dayKey(row.gameDate || row.resolvedAt || row.loggedAt, timeZone) === day.date && !row.resolved)) continue;
         const rate = day.decided ? `${(day.winRate * 100).toFixed(1)}%` : 'Not available (pushes only)';
         await outbox.enqueue(`day:${timeZone}:${day.date}`,

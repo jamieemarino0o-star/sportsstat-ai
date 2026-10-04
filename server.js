@@ -11,6 +11,7 @@ import { auditReport, isValidTimeZone } from './src/audit.js';
 import { SPORT_MARKETS } from './public/js/markets.js';
 import { createHistoryStore, readLocalRecords } from './src/history-store.js';
 import { createPredictionScanner } from './src/prediction-scanner.js';
+import { createOddsCache } from './src/odds-cache.js';
 import { createHash, timingSafeEqual } from 'node:crypto';
 
 const OPTIMIZED_PARAMS_FILE = fileURLToPath(new URL('./data/optimized-params.json', import.meta.url));
@@ -22,6 +23,31 @@ const LEDGER_FILE = fileURLToPath(new URL('./data/predictions.jsonl', import.met
 // re-run, and this keeps the endpoint honest without requiring a server restart to pick up updates.
 function readOptimizedParams() {
   try { return JSON.parse(readFileSync(OPTIMIZED_PARAMS_FILE, 'utf8')); } catch { return { generatedAt: null, sports: {} }; }
+}
+
+export async function sendStartupTelegramTest({ token = process.env.TELEGRAM_BOT_TOKEN?.trim(), chatId = process.env.TELEGRAM_CHAT_ID?.trim(), fetcher = fetch, logger = console } = {}) {
+  if (!token || !chatId) {
+    logger.log('[telegram] Startup test skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.');
+    return false;
+  }
+  logger.log('[telegram] Sending startup test message...');
+  try {
+    const response = await fetcher(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text: '✅ SportsStat AI Predictor: Telegram notifications are successfully configured for this group!' }),
+      signal: AbortSignal.timeout(10000),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (response.ok && body.ok === true) {
+      logger.log('[telegram] Startup test message sent successfully.');
+      return true;
+    }
+    logger.error(`[telegram] Startup test failed: HTTP ${response.status} - ${body.description || 'no description'}`);
+  } catch (error) {
+    logger.error(`[telegram] Startup test error: ${(error.message || error.name).replaceAll(token, '[redacted]')}`);
+  }
+  return false;
 }
 
 export function createApp(feeds = createFeeds(), { historyStore = null, backgroundJobs = null, jobToken = process.env.BACKGROUND_JOB_TOKEN || '' } = {}) {
@@ -49,7 +75,7 @@ export function createApp(feeds = createFeeds(), { historyStore = null, backgrou
   app.use('/api', rateLimit({ windowMs: 60000, limit: 150, standardHeaders: 'draft-8', legacyHeaders: false, message: { error: 'Too many requests. Please try again in a minute.' } }));
   app.use('/api/predictions', express.json({ limit: '4kb', strict: true }));
   // Ledger-derived payloads must never be cached by browsers or intermediaries.
-  app.use(['/api/audit', '/api/optimized-params', '/api/storage', '/api/ledger/export', '/api/jobs'], (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+  app.use(['/api/audit', '/api/optimized-params', '/api/storage', '/api/ledger/export', '/api/jobs', '/api/status'], (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
   app.get('/api/status', (req, res) => res.json(feeds.status()));
   let lastExternalTriggerAt = null;
   app.get('/api/jobs/status', (req, res) => res.json({ ...(backgroundJobs?.status() || { enabled: false }), externalTriggerEnabled: Boolean(jobToken && backgroundJobs), lastExternalTriggerAt }));
@@ -131,7 +157,7 @@ export function createApp(feeds = createFeeds(), { historyStore = null, backgrou
   app.use('/api', (req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
   app.use(express.static(fileURLToPath(new URL('./public', import.meta.url)), { etag: true, maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0 }));
   app.use((error, req, res, next) => {
-    if (error.code === 'HISTORY_STORAGE_UNAVAILABLE') return res.status(503).json({ error: error.message });
+    if (['HISTORY_STORAGE_UNAVAILABLE', 'ODDS_STORAGE_UNAVAILABLE', 'ODDS_UNAVAILABLE'].includes(error.code)) return res.status(503).json({ error: error.message });
     // Client errors raised by middleware (malformed JSON, oversized body) keep their 4xx status and
     // get a generic message; everything else is an upstream failure whose message feeds.js has
     // already reduced to a safe, secret-free summary.
@@ -152,7 +178,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     persistOutbox: historyStore?.saveOutbox,
   });
   const ledger = createLedger({ file: historyStore ? null : LEDGER_FILE, records, persist: historyStore?.append, notifier });
-  const feeds = createFeeds({ ledger });
+  const feeds = createFeeds({ ledger, oddsCache: createOddsCache({ store: historyStore }) });
   const scanner = createPredictionScanner({ feeds, sports: (process.env.BACKGROUND_SCAN_SPORTS || 'nfl').split(',').map((sport) => sport.trim().toLowerCase()).filter(Boolean) });
   let reconciling = false;
   const reconcilePending = async () => {
@@ -200,6 +226,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     console.log(`Prediction history: ${historyStore ? 'Supabase (durable)' : 'local file (not cloud-backed)'}`);
     console.log(`Background scanner: ${scanner.status().sports.join(', ')} every 10 minutes while running; configure Supabase Cron for Render Free`);
     console.log(`Telegram notifications ${notifier.enabled ? 'enabled' : 'disabled (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to enable)'}`);
+    void sendStartupTelegramTest();
   });
   for (const signal of ['SIGTERM', 'SIGINT']) {
     process.on(signal, () => {

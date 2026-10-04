@@ -14,10 +14,10 @@ const fakeFetch = (calls, { ok = true, status = 200, body = { ok: true } } = {})
 const pick = { sport: 'nfl', eventId: '1', homeTeam: 'Buffalo Bills', awayTeam: 'Los Angeles Chargers', homeProbability: 0.6, selection: 'home', selectionPrice: 1.9, gameDate: '2026-10-02T00:15:00Z', updatedAt: '2026-10-01T14:00:00Z', resolvedAt: '2026-10-02T03:30:00Z' };
 
 test('message formats match the required templates', () => {
-  assert.equal(newBetMessageFromEntry(pick), '🚀 New Bet Detected!\nMatch: Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 2, 2026, 12:15 AM UTC\nPick: Buffalo Bills\nModel pick probability: 60.0%\nOdds: 1.90\nEV: +14.0%');
+  assert.equal(newBetMessageFromEntry(pick), '🚀 New Bet Detected!\nMatch: Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 1, 2026, 8:15 PM EDT\nPick: Buffalo Bills\nModel pick probability: 60.0%\nOdds: 1.90\nEV: +14.0%');
   assert.ok(Math.abs(expectedValuePercent({ ...pick, selection: 'away', selectionPrice: 2 }) - -20) < 1e-9);
   const won = resultMessageFromEntry({ ...pick, resolved: true, homeScore: 24, awayScore: 16 });
-  assert.equal(won, '🏁 Final Result - Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 2, 2026, 12:15 AM UTC\nSettled: Oct 2, 2026, 3:30 AM UTC\nModel pick probability: 60.0%\nWinner: Buffalo Bills\nStatus: ✅ Won (Final 16-24)');
+  assert.equal(won, '🏁 Final Result - Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 1, 2026, 8:15 PM EDT\nSettled: Oct 1, 2026, 11:30 PM EDT\nModel pick probability: 60.0%\nWinner: Buffalo Bills\nStatus: ✅ Won (Final 16-24)');
   assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 10, awayScore: 20 }), /Winner: Los Angeles Chargers\nStatus: ❌ Lost/);
   assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 1, awayScore: 1 }), /Winner: Draw\nStatus: Push/);
 });
@@ -38,6 +38,7 @@ test('notification timestamps handle local date boundaries, DST and missing date
   assert.match(newBetMessageFromEntry(pick, { timeZone: 'America/New_York' }), /Game time: Oct 1, 2026, 8:15 PM EDT/);
   assert.match(resultMessageFromEntry({ ...pick, homeScore: 24, awayScore: 16 }, { timeZone: 'America/New_York' }), /Settled: Oct 1, 2026, 11:30 PM EDT/);
   assert.equal(formatNotificationTime('2026-12-02T00:15:00Z', 'America/New_York'), 'Dec 1, 2026, 7:15 PM EST');
+  assert.equal(formatNotificationTime('2026-12-02T00:15:00Z'), 'Dec 1, 2026, 7:15 PM EST');
   for (const value of [undefined, null, '', 'not-a-date']) assert.equal(formatNotificationTime(value), 'Not available');
   assert.match(newBetMessageFromEntry({ ...pick, gameDate: null }), /Game time: Not available\nPick:/);
   assert.throws(() => createTelegramNotifier({ timeZone: 'Invalid/Zone' }), RangeError);
@@ -192,7 +193,27 @@ test('daily summary does not close early even if every currently tracked game is
     time = Date.parse('2026-10-03T00:00:00Z');
     await notifier.syncLedger(file);
     assert.match(calls.at(-1).body.text, /Wins: 0\/0\nWin rate: Not available \(pushes only\)/);
+    const sentCount = calls.length;
+    notifier.close();
+    notifier = createTelegramNotifier({ token: 't', chatId: 'c', minEv: null, gapMs: 0, schedule: false, now: () => time, fetcher: fakeFetch(calls),
+      outboxState: { pending: [], sent: ['bet:nfl:1', 'result:nfl:1', 'day:UTC:2026-10-02'] } });
+    await notifier.syncLedger(file);
+    assert.equal(calls.length, sentCount); // Quebec default does not replay days already summarized in UTC
   } finally { notifier?.close(); rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('startup Telegram test trims the chat ID and logs success or failure without the token', async () => {
+  const { sendStartupTelegramTest } = await import('../server.js');
+  const logs = [];
+  const logger = { log: (line) => logs.push(line), error: (line) => logs.push(line) };
+  const calls = [];
+  assert.equal(await sendStartupTelegramTest({ token: 'secret-token', chatId: '-100123', fetcher: fakeFetch(calls), logger }), true);
+  assert.equal(calls[0].body.chat_id, '-100123');
+  assert.match(calls[0].body.text, /successfully configured for this group/);
+  assert.equal(await sendStartupTelegramTest({ token: 'secret-token', chatId: 'x', fetcher: async () => { throw new Error('failed secret-token'); }, logger }), false);
+  assert.equal(await sendStartupTelegramTest({ token: '', chatId: 'x', logger }), false);
+  assert.ok(logs.some((line) => /sent successfully/.test(line)) && logs.some((line) => /skipped/.test(line)));
+  assert.ok(!logs.join('\n').includes('secret-token'));
 });
 
 test('cloud outbox waits for persistence, retains concurrent messages and restores acknowledgements', async () => {

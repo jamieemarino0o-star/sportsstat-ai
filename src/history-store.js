@@ -58,6 +58,16 @@ export function createHistoryStore({ env = process.env, client = null } = {}) {
     }
   }
 
+  async function oddsRequest(name, parameters) {
+    try {
+      const response = await database.rpc(name, parameters);
+      if (response.error || !response.data) throw new Error('Database request failed');
+      return response.data;
+    } catch {
+      throw Object.assign(new Error('Odds cache unavailable. Check Supabase and apply the latest supabase/schema.sql; paid requests are blocked.'), { status: 503, code: 'ODDS_STORAGE_UNAVAILABLE' });
+    }
+  }
+
   return {
     status: () => ({ backend: 'supabase', durable: true, lastSavedAt, lastLoadedAt, error: lastError }),
     cachedRecords: () => [...records],
@@ -91,6 +101,8 @@ export function createHistoryStore({ env = process.env, client = null } = {}) {
     async saveOutbox(state) {
       await request(() => database.from('notification_state').upsert({ id: 'telegram', payload: state }));
     },
+    claimOdds: (key, ttlMs, limit) => oddsRequest('claim_odds_request', { cache_key: key, ttl_ms: ttlMs, max_credits: limit }),
+    completeOdds: (key, reservation, payload, remaining) => oddsRequest('complete_odds_request', { cache_key: key, reservation, response_payload: payload, remaining_credits: remaining }),
   };
 }
 

@@ -16,7 +16,7 @@
     "history:import": "node --env-file-if-exists=.env src/history-store.js import",
     "history:export": "node --env-file-if-exists=.env src/history-store.js export",
     "test": "node --test tests/*.test.js",
-    "check": "node --check server.js && node --check src/feeds.js && node --check src/ledger.js && node --check src/history-store.js && node --check src/prediction-scanner.js && node --check src/backtest.js && node --check src/optimize.js && node --check src/audit.js && node --check src/notifier.js && node --check src/notification-outbox.js && node --check public/js/app.js && node --check public/js/model.js && node --check public/js/quants.js && node --check public/js/markets.js && node --check public/js/bets.js && node --check public/js/research.js && node --check public/js/audit.js",
+    "check": "node --check server.js && node --check src/feeds.js && node --check src/odds-cache.js && node --check src/ledger.js && node --check src/history-store.js && node --check src/prediction-scanner.js && node --check src/backtest.js && node --check src/optimize.js && node --check src/audit.js && node --check src/notifier.js && node --check src/notification-outbox.js && node --check public/js/app.js && node --check public/js/model.js && node --check public/js/quants.js && node --check public/js/markets.js && node --check public/js/bets.js && node --check public/js/research.js && node --check public/js/audit.js",
     "telegram:test": "node --env-file-if-exists=.env src/notifier.js"
   },
   "dependencies": {

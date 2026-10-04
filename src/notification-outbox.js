@@ -77,6 +77,7 @@ export function createNotificationOutbox({ file = null, send, gapMs = 1100, retr
   }
 
   return {
+    knownIds: () => [...state.sent, ...state.pending.map((job) => job.id)],
     enqueue(id, text) {
       return update((current) => current.sent.includes(id) || current.pending.some((job) => job.id === id)
         ? current : { ...current, pending: [...current.pending, { id, text, attempts: 0, nextAt: now() }] }).then(flush).catch((error) => {

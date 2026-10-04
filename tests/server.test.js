@@ -3,6 +3,63 @@ import assert from 'node:assert/strict';
 import { createApp } from '../server.js';
 import { createFeeds } from '../src/feeds.js';
 import { createLedger } from '../src/ledger.js';
+import { createOddsCache } from '../src/odds-cache.js';
+
+test('odds polling coalesces calls and enforces a shared budget without blocking ESPN', async () => {
+  let paidCalls = 0;
+  const feeds = createFeeds({ oddsKey: 'fixture-key', oddsCache: createOddsCache({ budgetLimit: 1 }), fetcher: async (url) => {
+    if (url.includes('the-odds-api')) paidCalls += 1;
+    return Response.json(url.includes('the-odds-api') ? [{ id: 'odds-event' }] : { events: [] });
+  } });
+  const [first, duplicate] = await Promise.all([feeds.odds('nfl'), feeds.odds('nfl')]);
+  assert.deepEqual(duplicate, first);
+  assert.equal(paidCalls, 1);
+  assert.equal(feeds.status().odds.budget.used, 1);
+  assert.equal(feeds.status().odds.budget.intervalMs, 43200000);
+  await assert.rejects(feeds.odds('nba'), { code: 'ODDS_UNAVAILABLE' });
+  assert.deepEqual(await feeds.odds('nfl'), first);
+  assert.deepEqual((await feeds.scoreboard('nfl')).games, []);
+  assert.equal(paidCalls, 1);
+});
+
+test('odds fail closed on storage outages and retain reservations for failed calls', async (context) => {
+  let calls = 0;
+  const brokenStore = { claimOdds: async () => { throw Object.assign(new Error('Odds cache unavailable'), { code: 'ODDS_STORAGE_UNAVAILABLE' }); } };
+  const feeds = createFeeds({ oddsKey: 'fixture-key', oddsCache: createOddsCache({ store: brokenStore }), fetcher: async () => { calls += 1; return Response.json([]); } });
+  const server = createApp(feeds).listen(0, '127.0.0.1');
+  context.after(() => new Promise((resolve) => server.close(resolve)));
+  await new Promise((resolve) => server.once('listening', resolve));
+  const response = await fetch(`http://127.0.0.1:${server.address().port}/api/odds?sport=nfl`);
+  assert.equal(response.status, 503);
+  assert.equal(calls, 0);
+  const failed = createFeeds({ oddsKey: 'fixture-key', oddsCache: createOddsCache({ budgetLimit: 1 }), fetcher: async () => { calls += 1; throw new Error('fixture-secret'); } });
+  await assert.rejects(failed.odds('nfl'), /Upstream feed is unavailable/);
+  await assert.rejects(failed.odds('nfl'), /temporarily paused/);
+  await assert.rejects(failed.odds('nba'), /budget is exhausted/);
+  assert.equal(calls, 1);
+});
+
+test('odds cache refreshes after twelve hours and releases budget after 31 days', async () => {
+  let time = Date.parse('2026-10-01T00:00:00Z');
+  let calls = 0;
+  const cache = createOddsCache({ now: () => time, budgetLimit: 2 });
+  const load = async () => { calls += 1; return { data: [], time, remaining: 425 - calls }; };
+  await cache.get('odds:nfl', load);
+  time += 12 * 60 * 60 * 1000 - 1;
+  await cache.get('odds:nfl', load);
+  assert.equal(calls, 1);
+  time += 1;
+  await cache.get('odds:nfl', load);
+  assert.equal(calls, 2);
+  time += 12 * 60 * 60 * 1000;
+  await assert.rejects(cache.get('odds:nfl', load), /budget is exhausted/);
+  time = Date.parse('2026-11-01T00:00:00Z');
+  await cache.get('odds:nfl', load);
+  assert.equal(calls, 3);
+  assert.equal(cache.status().used, 2);
+  assert.throws(() => createOddsCache({ budgetLimit: 401 }), /ODDS_CREDIT_LIMIT/);
+  assert.throws(() => createOddsCache({ ttlMs: 0 }), /ODDS_POLL_INTERVAL_MS/);
+});
 
 test('proxy validates parameters and hides its implementation header', async (context) => {
   const app = createApp({ status: () => ({ espn: { state: 'idle' } }), scoreboard: async () => ({ games: [] }), injuries: async () => ({ teams: [] }) });
@@ -274,6 +331,8 @@ test('advanced WNBA endpoint joins exact props to unique historical games and so
   const calls = requested.length;
   await fetch(`${base}&window=20`);
   assert.equal(requested.length, calls);
+  assert.equal(feeds.status().odds.budget.used, 2);
+  assert.equal(requested.filter((url) => new URL(url).hostname === 'api.the-odds-api.com').length, 2);
 });
 
 test('NFL summaries include previous and current drive plays without duplicates', async () => {

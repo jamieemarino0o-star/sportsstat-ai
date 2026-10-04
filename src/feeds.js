@@ -1,6 +1,7 @@
 import { normalizeEvent } from '../public/js/model.js';
 import { MARKETS, analyzeMarket, bestQuotes, findOddsEvent, marketQuotes, readPlayerStat, gameMarketValue } from '../public/js/markets.js';
 import { createLedger } from './ledger.js';
+import { createOddsCache } from './odds-cache.js';
 
 export const SPORTS = {
   nfl: { path: 'football/nfl', odds: 'americanfootball_nfl', name: 'NFL' },
@@ -15,11 +16,6 @@ const BOOKS = ['draftkings', 'fanduel', 'betmgm'];
 const LINE_HISTORY_MAX_SNAPSHOTS = 200;
 const LINE_HISTORY_MAX_EVENTS = 500;
 const LINE_HISTORY_MAX_AGE = 3 * 24 * 60 * 60 * 1000;
-// The Odds API free tier grants a limited monthly credit pool. Polling every 3 minutes across six
-// sports would exhaust it in days, so odds requests (and the line-movement snapshots derived from
-// them) are shared off a single cache entry per sport and only refreshed this often by default.
-// Override with ODDS_POLL_INTERVAL_MS (milliseconds) if a paid plan allows tighter polling.
-const ODDS_TTL = Number(process.env.ODDS_POLL_INTERVAL_MS) > 0 ? Number(process.env.ODDS_POLL_INTERVAL_MS) : 30 * 60 * 1000;
 
 function snapshotMoneyline(event, time) {
   const books = {};
@@ -38,7 +34,8 @@ function snapshotMoneyline(event, time) {
 
 const OVERDUE_SWEEP_INTERVAL = 15 * 60 * 1000;
 
-export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY, ledger = createLedger() } = {}) {
+export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY, ledger = createLedger(), oddsCache = createOddsCache() } = {}) {
+  const ODDS_TTL = oddsCache.ttlMs;
   const cache = new Map();
   const pending = new Map();
   const waiting = [];
@@ -78,16 +75,24 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
       if (active >= 5) await new Promise((resolve) => waiting.push(resolve));
       else active += 1;
       try {
-        const response = await fetcher(url, { signal: AbortSignal.timeout(10000), headers: { Accept: 'application/json' } });
-        if (!response.ok) throw new Error(`${provider === 'espn' ? 'ESPN' : 'The Odds API'} returned HTTP ${response.status}`);
-        const data = await response.json();
-        const result = { data, time: Date.now() };
+        const load = async () => {
+          const response = await fetcher(url, { signal: AbortSignal.timeout(10000), headers: { Accept: 'application/json' } });
+          if (!response.ok) throw new Error(`${provider === 'espn' ? 'ESPN' : 'The Odds API'} returned HTTP ${response.status}`);
+          const data = await response.json();
+          const remaining = response.headers.get('x-requests-remaining');
+          return { data, time: Date.now(), remaining: remaining !== null && Number.isInteger(Number(remaining)) ? Number(remaining) : null };
+        };
+        const result = provider === 'odds' ? await oddsCache.get(key, load) : await load();
         cache.set(key, result);
         if (cache.size > 400) cache.delete(cache.keys().next().value);
         health[provider] = { state: 'connected', lastSuccess: new Date(result.time).toISOString(), message: 'Feed connected' };
-        if (provider === 'odds') health.odds.remaining = response.headers.get('x-requests-remaining');
+        if (provider === 'odds') health.odds.remaining = result.remaining == null ? null : String(result.remaining);
         return result;
       } catch (error) {
+        if (['ODDS_UNAVAILABLE', 'ODDS_STORAGE_UNAVAILABLE'].includes(error.code)) {
+          health.odds = { ...health.odds, state: 'error', message: error.message };
+          throw error;
+        }
         const message = error.name === 'TimeoutError' ? 'Upstream request timed out' : error.message.startsWith('ESPN returned') || error.message.startsWith('The Odds API returned') ? error.message : 'Upstream feed is unavailable';
         health[provider] = { ...health[provider], state: 'error', message };
         throw new Error(message);
@@ -124,7 +129,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
   const source = (sport, resource, time) => ({ provider: 'ESPN', url: `https://site.api.espn.com/apis/site/v2/sports/${SPORTS[sport].path}/${resource}`, fetchedAt: new Date(time).toISOString() });
 
   const feeds = {
-    status: () => ({ espn: { ...health.espn }, odds: { ...health.odds }, serverTime: new Date().toISOString() }),
+    status: () => ({ espn: { ...health.espn }, odds: { ...health.odds, budget: oddsCache.status() }, serverTime: new Date().toISOString() }),
     async scoreboard(sport) {
       const result = await espn(sport, 'scoreboard', 20000);
       const games = (result.data.events || []).map((event) => normalizeEvent(event, sport, source(sport, 'scoreboard', result.time))).filter(Boolean);
@@ -252,7 +257,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
         }),
         quotes,
       };
-      cache.set(cacheKey, { time: Date.now(), data: result });
+      cache.set(cacheKey, { time: prices.time, data: result });
       return result;
     },
   };

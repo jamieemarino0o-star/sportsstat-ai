@@ -8,6 +8,64 @@ import { backtestFile } from '../src/backtest.js';
 import { optimizeSport } from '../src/optimize.js';
 import { readFileSync } from 'node:fs';
 import { PGlite } from '@electric-sql/pglite';
+import { createOddsCache } from '../src/odds-cache.js';
+import { createFeeds } from '../src/feeds.js';
+
+test('durable odds cache survives restarts, shares the last credit and retains failed reservations', async () => {
+  const database = new PGlite();
+  let paidCalls = 0;
+  let completionFailure = false;
+  try {
+    await database.exec('create role anon; create role authenticated; create role service_role bypassrls;');
+    await database.exec(readFileSync(new URL('../supabase/schema.sql', import.meta.url), 'utf8'));
+    await database.exec('set role service_role;');
+    const client = createClient('https://fixture.supabase.co', 'fixture-server-key', {
+      auth: { persistSession: false, autoRefreshToken: false },
+      global: { fetch: async (input, options) => {
+        const name = new URL(input).pathname.split('/').at(-1);
+        const parameters = JSON.parse(options.body);
+        let response;
+        if (name === 'claim_odds_request') response = await database.query('select public.claim_odds_request($1, $2, $3) as result', [parameters.cache_key, parameters.ttl_ms, parameters.max_credits]);
+        else if (name === 'complete_odds_request') {
+          if (completionFailure) return Response.json({ message: 'fixture-secret' }, { status: 400 });
+          response = await database.query('select public.complete_odds_request($1, $2, $3, $4) as result', [parameters.cache_key, parameters.reservation, parameters.response_payload === null ? null : JSON.stringify(parameters.response_payload), parameters.remaining_credits]);
+        } else assert.fail(`Unexpected RPC ${name}`);
+        return Response.json(response.rows[0].result);
+      } },
+    });
+    const freshFeeds = () => createFeeds({
+      oddsKey: 'fixture-key',
+      oddsCache: createOddsCache({ store: createHistoryStore({ client, env: {} }), budgetLimit: 3 }),
+      fetcher: async () => { paidCalls += 1; return Response.json([{ id: 'event', bookmakers: [] }], { headers: { 'x-requests-remaining': '424' } }); },
+    });
+    const first = await freshFeeds().odds('nfl');
+    const restored = freshFeeds();
+    assert.deepEqual(await restored.odds('nfl'), first);
+    assert.equal(paidCalls, 1);
+    assert.equal(restored.status().odds.budget.durable, true);
+    assert.equal(restored.status().odds.budget.used, 1);
+    assert.equal(restored.status().odds.remaining, '424');
+    await Promise.allSettled([freshFeeds().odds('nba'), freshFeeds().odds('nba')]);
+    assert.equal(paidCalls, 2);
+    const lastCredit = await Promise.allSettled([freshFeeds().odds('nhl'), freshFeeds().odds('mlb')]);
+    assert.equal(lastCredit.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(lastCredit.find((result) => result.status === 'rejected').reason.code, 'ODDS_UNAVAILABLE');
+    assert.equal(paidCalls, 3);
+    await database.exec("update odds_cache set fetched_at = now() - interval '13 hours' where key = 'odds:nfl';");
+    await assert.rejects(freshFeeds().odds('nfl'), /budget is exhausted/);
+    assert.equal(paidCalls, 3);
+    await database.exec("update odds_usage set reserved_at = now() - interval '32 days';");
+    await freshFeeds().odds('nfl');
+    assert.equal(paidCalls, 4);
+    completionFailure = true;
+    await assert.rejects(freshFeeds().odds('epl'), (error) => error.code === 'ODDS_STORAGE_UNAVAILABLE' && !error.message.includes('fixture-secret'));
+    completionFailure = false;
+    const restarted = freshFeeds();
+    await assert.rejects(restarted.odds('epl'), /already reserved/);
+    assert.equal(paidCalls, 5);
+    assert.equal(restarted.status().odds.budget.used, 2);
+  } finally { await database.close(); }
+});
 
 function fixture() {
   const rows = new Map();
@@ -94,11 +152,39 @@ test('Postgres schema is repeatable, denies browser roles and keeps prediction r
     await assert.rejects(database.query('insert into prediction_records (id, payload) values ($1, $2)', ['invalid', '{}']), /check constraint/);
     await database.query('insert into notification_state values ($1, $2)', ['telegram', JSON.stringify({ pending: [], sent: [] })]);
     await database.query('update notification_state set payload = $1', [JSON.stringify({ pending: [], sent: ['bet:mlb:1'] })]);
+    const claim = async (key, limit = 2) => (await database.query('select public.claim_odds_request($1, $2, $3) as result', [key, 43200000, limit])).rows[0].result;
+    const first = await claim('odds:nfl');
+    assert.equal(first.state, 'reserved');
+    assert.equal(first.budget.used, 1);
+    assert.equal((await claim('odds:nfl')).state, 'waiting');
+    const oddsPayload = JSON.stringify([{ id: 'event', bookmakers: [] }]);
+    await database.query('select public.complete_odds_request($1, $2, $3, $4)', ['odds:nfl', first.reservationId, oddsPayload, 424]);
+    const cached = await claim('odds:nfl');
+    assert.equal(cached.state, 'cached');
+    assert.equal(cached.budget.used, 1);
+    assert.equal(cached.providerRemaining, 424);
+    assert.deepEqual(cached.data, JSON.parse(oddsPayload));
+    const second = await claim('odds:nba');
+    assert.equal(second.state, 'reserved');
+    assert.equal((await claim('odds:mlb')).state, 'budget');
+    assert.equal((await claim('odds:nfl')).state, 'cached');
+    await database.query('select public.complete_odds_request($1, $2, $3)', ['odds:nba', second.reservationId, null]);
+    assert.equal((await claim('odds:nba')).state, 'waiting');
+    await assert.rejects(database.query('select public.complete_odds_request($1, $2, $3)', ['odds:nfl', first.reservationId, '[]']), /expired or replaced/);
+    await database.exec("update public.odds_usage set reserved_at = now() - interval '32 days'; update public.odds_cache set fetched_at = now() - interval '13 hours' where key = 'odds:nfl';");
+    const expired = await claim('odds:nfl');
+    assert.equal(expired.state, 'reserved');
+    assert.equal(expired.budget.used, 1);
+    assert.equal((await claim('odds:nhl', 0)).state, 'budget');
     for (const role of ['anon', 'authenticated']) {
       await database.exec(`reset role; set role ${role};`);
       await assert.rejects(database.query('select * from prediction_records'), /permission denied/);
       await assert.rejects(database.query('insert into prediction_records (id, payload) values ($1, $2)', ['blocked', payload]), /permission denied/);
       await assert.rejects(database.query('select * from notification_state'), /permission denied/);
+      await assert.rejects(database.query('select * from odds_cache'), /permission denied/);
+      await assert.rejects(database.query('select * from odds_usage'), /permission denied/);
+      await assert.rejects(database.query("select public.claim_odds_request('odds:nfl', 43200000, 400)"), /permission denied/);
+      await assert.rejects(database.query('select public.odds_budget_status(400)'), /permission denied/);
     }
   } finally { await database.close(); }
 });

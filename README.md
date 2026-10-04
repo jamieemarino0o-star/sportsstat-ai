@@ -31,7 +31,7 @@ ESPN requires no API key. Real DraftKings, FanDuel and BetMGM odds require your 
 cp .env.example .env
 ```
 
-Set `ODDS_API_KEY` in `.env`, then restart Node. Never put the key in frontend code or commit `.env`. The proxy requests US moneylines and, when selected, per-event props, spreads and totals for DraftKings, FanDuel and BetMGM. Availability depends on league, market, region, provider coverage and subscription. Requests and analysis are cached for 30 minutes by default (`ODDS_POLL_INTERVAL_MS` overrides this, in milliseconds) so a free-tier monthly credit budget (e.g. 500 credits) is not exhausted by continuous polling across six leagues; every cached fetch also feeds the line-movement snapshot store below at no extra API cost.
+Set `ODDS_API_KEY` in `.env`, then restart Node. Never put the key in frontend code or commit `.env`. The proxy requests US moneylines and, when selected, per-event props, spreads and totals for DraftKings, FanDuel and BetMGM. Availability depends on league, market, region, provider coverage and subscription. Odds refresh every 12 hours by default (`ODDS_POLL_INTERVAL_MS` overrides this, in milliseconds). A shared budget limits new requests to 400 in a rolling 31-day window, including per-event markets. Supabase persists both the odds cache and reservations across restarts; local development without Supabase uses memory only. Each cached fetch also feeds the in-memory line-movement snapshot store at no extra API cost. See "Durable Odds Budget" below before deploying.
 
 Without a key, live scores and historical analysis still work, but actual sportsbook markets remain unavailable.
 
@@ -44,11 +44,12 @@ All sportsbook quotes are displayed in decimal odds (for example, `1.91` or `2.5
 ```sh
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_CHAT_ID=123456789
-TELEGRAM_TIME_ZONE=America/New_York  # optional IANA time zone; default UTC
 TELEGRAM_MIN_EV=3   # optional: only announce picks with EV >= 3%
 ```
 
-Restart Node and run `npm run telegram:test` to confirm delivery. Both bet and result messages include the model's selected-side probability as a percentage. New-bet messages include the scheduled game date/time, without a detection date; result messages include the scheduled game date/time and settlement date/time (when the server reconciles the result, not necessarily the final whistle). The result probability reflects the latest recorded pick, not necessarily the initially announced pick. Times include a time-zone label and respect daylight saving time. Older records without a game date show "Not available". An invalid `TELEGRAM_TIME_ZONE` is rejected at startup. A pick is announced once per event, including across side flips, not on every refresh; results are announced once on reconciliation. Sends are queued about one per second, and failures are logged without the token and never affect the ledger. Without both credential variables, notifications are disabled.
+Every server start sends a confirmation message to the configured chat and logs success or the Telegram error in Render logs. Each restart or Render Free wake-up sends another one. Notification times always use Quebec time (`America/Toronto`, EDT/EST); daily summaries already sent for a date under an older time zone are not replayed.
+
+Restart Node and run `npm run telegram:test` to confirm delivery. Both bet and result messages include the model's selected-side probability as a percentage. New-bet messages include the scheduled game date/time, without a detection date; result messages include the scheduled game date/time and settlement date/time (when the server reconciles the result, not necessarily the final whistle). The result probability reflects the latest recorded pick, not necessarily the initially announced pick. Times include a time-zone label and respect daylight saving time. Older records without a game date show "Not available". A pick is announced once per event, including across side flips, not on every refresh; results are announced once on reconciliation. Sends are queued about one per second, and failures are logged without the token and never affect the ledger. Without both credential variables, notifications are disabled.
 
 The server persists pending messages and delivery acknowledgements in `data/telegram-outbox.json` (gitignored), using an atomic replace before sending. Network errors, invalid credentials and API failures retain messages for exponential-backoff retries; Telegram's `retry_after` is respected. There is no 100-message drop limit. Keep one process per outbox and provide a persistent disk: committing the prediction ledger does **not** preserve delivery state or newly generated messages on an ephemeral host. Storage failures are logged and the ledger is re-scanned on startup and every 30 seconds to recover missing bet/result enqueue operations. Pending games are checked against ESPN every five minutes even when no browser is open; off-scoreboard reconciliation retains its existing per-sport throttle.
 
@@ -96,7 +97,7 @@ Browser -> same-origin Express proxy -> ESPN scoreboard / schedule / summary / i
 
 Schedules and selected game details poll every 30 seconds while the page is visible. Polling pauses while a dialog is open and can be switched off. There are no WebSocket or subsecond latency claims.
 
-The proxy uses a 20-second score/summary cache, a five-minute injury-report cache, a 15-minute history cache and a three-minute odds/market cache. It coalesces identical requests, limits upstream concurrency to five, times out individual upstream fetches after 10 seconds, and rate-limits each client to 150 API requests/minute. History loads progressively with three frontend workers. Advanced props can inspect up to 20 historical box scores per team and may take longer on a cold cache; missing or partial history is disclosed. Per-event market queries consume additional provider quota.
+The proxy uses a 20-second score/summary cache, a five-minute injury-report cache, a 15-minute history cache and a 12-hour odds/market cache. It coalesces identical requests, limits upstream concurrency to five, times out individual upstream fetches after 10 seconds, and rate-limits each client to 150 API requests/minute. History loads progressively with three frontend workers. Advanced props can inspect up to 20 historical box scores per team and may take longer on a cold cache; missing or partial history is disclosed. Per-event market queries consume additional provider quota and share the same protected budget as moneylines.
 
 Provider errors are explicit. Failed odds requests remove prices instead of displaying cached odds as current. If a scoreboard refresh fails, the last successful scoreboard stays visible with a warning and timestamp. Scores, lineups, statistics, probabilities and play-by-play coverage vary by event and provider.
 
@@ -287,9 +288,23 @@ limit 5;
 
 A 401 means the two job tokens differ. A 503 means the trigger is not configured (or the host is unavailable). Enable the named job in the Cron dashboard after any project pause; do not assume paused free services will continue executing.
 
-**Odds budget:** start with one league and consider `ODDS_POLL_INTERVAL_MS=21600000` in Render (six hours). A continuously running one-league moneyline scan then needs at most roughly four successful odds refreshes per day per process, excluding restarts, failures and extra markets. Prices can be up to six hours old and new games may wait for the next odds refresh; this sacrifices freshness to conserve credits. The existing default is 30 minutes and can exhaust a free odds allowance under unattended use. More leagues, shorter intervals and props use more credits; monitor `/api/status` and your provider dashboard. No code upgrades a paid plan automatically.
+**Odds budget:** the scanner's 10-minute cadence is independent of the 12-hour odds refresh. Five active leagues at two moneyline refreshes per day need roughly 310 credits over 31 days, leaving room under the default 400-call guard. Browser requests and extra markets share this budget. Prices can be up to 12 hours old, new games may wait for the next refresh, and the closing-line proxy can be stale. This setting prioritizes free-tier usage, not live price accuracy.
 
 Do not run another server instance or a separate worker against the same notification outbox. The scheduled HTTP job targets the existing process, where overlapping scans are coalesced and scans are throttled to at most once every 10 minutes.
+
+### Durable Odds Budget
+
+1. Before deploying this update, re-run all of [supabase/schema.sql](supabase/schema.sql) in the existing project's SQL Editor. It preserves prediction history and notification state, and adds `odds_cache`, `odds_usage` and backend-only RPC functions. No Vault or Cron changes are needed.
+2. In Render, set `ODDS_POLL_INTERVAL_MS=43200000` and `ODDS_CREDIT_LIMIT=400`. Existing environment values override the new defaults. The limit accepts 0-400; use a lower number if fewer than 400 provider credits remain in the current billing period, with a margin for any other consumers of the same key. Set 0 to stop new paid calls while still serving unexpired cached prices.
+3. Deploy the code. After the first odds lookup, `/api/status` reports `odds.budget.durable: true`, `intervalMs: 43200000`, `limit`, `used`, `remaining`, `windowDays: 31` and `nextReleaseAt`. These are the budget snapshot from the last cache lookup/reservation, not the provider's billing balance. `odds.remaining` is the provider balance at the last fetched odds response and can also be old.
+
+Before every uncached Odds API request, the server atomically reserves one credit in Supabase. Current requests specify one market and three bookmakers, normally costing at most one provider credit. Concurrent processes cannot reserve beyond the shared cap or refresh the same cache key concurrently during its two-minute lease. A successfully saved response retains its original fetch timestamp when restored after a restart.
+
+Every attempted call remains counted for 31 days, even empty responses, HTTP errors, timeouts or a crash before the request reaches the provider. This deliberately overestimates real usage; no refunds or automatic retries spend untracked credits. Failed fetches pause that key for 15 minutes. A crash or failed cache save retains the reservation and its lease. Reservations and old cache entries are pruned automatically during new lookups; there is no calendar-month reset that can accidentally replenish the budget mid-cycle.
+
+When the cap is reached, unexpired cached odds remain usable; once they expire, odds routes return an explicit 503 and the scanner skips unpriced predictions. ESPN result reconciliation and Telegram queue recovery keep running. Missing schema, database failures or failed reservations block new paid requests rather than silently falling back to memory. Without Supabase, the local cache and counter do not survive restarts.
+
+The cap only covers requests made by this updated app against the same Supabase project. It cannot account for credits spent before deployment or by other apps using the key, and must not be reset by deleting usage records. It does not guarantee continuous collection or alert delivery. No code upgrades a paid plan automatically.
 
 ### Recover and Back Up
 
@@ -331,7 +346,7 @@ This is a working, production-minded starter, not a certified production betting
 - Backtest out-of-time, measure probability calibration, address data leakage and settlement rules, and add injury/lineup features before relying on estimates.
 - Replace Tailwind's development CDN with compiled CSS; self-host pinned Lucide/fonts/assets. The current CSP permits inline styles/scripts and eval for the requested CDN workflow. Tighten it for deployment.
 - Deploy behind HTTPS with authentication where needed, a secret manager, request logging without credentials, monitoring and error reporting. Set `NODE_ENV=production` behind TLS.
-- Use a shared cache and distributed rate-limit store for multiple server instances, and manage sportsbook quotas per plan. The current stores are in memory and intended for one local process.
+- Odds caching and credit reservations are shared through Supabase, but ESPN caches, client rate limiting and ledger/outbox ownership still assume one server process. Do not add instances without addressing those remaining constraints.
 - Provide accessibility/security audits, your jurisdiction's age checks and required responsible-gaming controls before offering any wagering workflow. This app does not accept wagers or manage money.
 
 Team marks are supplied by ESPN. The stadium photograph is served from Unsplash. Review third-party asset and data rights before commercial distribution.
