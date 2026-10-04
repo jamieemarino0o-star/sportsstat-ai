@@ -1,4 +1,4 @@
-import { predictGame, expectedValue, impliedProbability, formatDecimalOdds, matchOdds } from './model.js';
+import { predictGame, predictionSettings, expectedValue, impliedProbability, formatDecimalOdds, matchOdds } from './model.js';
 import { expectedGoals, poissonMatrix, matchupProbabilities, totalGoalsDistribution, probabilityOverLine, classifyRisk } from './quants.js';
 import { createResearchWorkspace } from './research.js';
 import { createAuditWorkspace } from './audit.js';
@@ -29,61 +29,16 @@ const audit = createAuditWorkspace({ state, api, render, icons, toast });
 
 function biasFactor() { return state.calibration.get(state.sport)?.biasFactor || 0; }
 
-// Two candidate recency-decay values to explore until the ledger has enough reconciled samples at
-// each to declare a confident winner (state.calibration's bestDecay). A prediction's displayed and
-// logged decay must always be the same value, so this hash keeps the choice stable per game ID
-// rather than random, letting the ledger accumulate genuine head-to-head comparison data over time.
-const DECAY_CANDIDATES = [1, 0.85];
-// Strength-of-schedule adjustment weights to explore the same way, spanning the user-requested 0.0
-// to 0.5 range (coarsened to 5 points so each arm can still accumulate a meaningful reconciled
-// sample size; the model's long-standing default of 0.3 sits at the midpoint).
-const SOS_CANDIDATES = [0, 0.125, 0.25, 0.375, 0.5];
-
-// Deterministic per-game hash so the same game always resolves to the same candidate value while it
-// is being displayed and logged, keeping the ledger an honest, reproducible record. `salt` keeps
-// independently-explored parameters (decay vs. sosWeight) from ending up correlated with each other.
-function hashPick(gameId, salt, candidates) {
-  let hash = 0;
-  for (const character of `${salt}:${gameId}`) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
-  return candidates[hash % candidates.length];
-}
-
 function decayFor(gameId) {
-  const stats = state.calibration.get(state.sport);
-  if (Number.isFinite(stats?.bestDecay)) return stats.bestDecay;
-  return hashPick(gameId, 'decay', DECAY_CANDIDATES);
+  return predictionSettings(gameId, state.calibration.get(state.sport)).decay;
 }
 
 function sosWeightFor(gameId) {
-  const stats = state.calibration.get(state.sport);
-  if (Number.isFinite(stats?.bestSosWeight)) return stats.bestSosWeight;
-  return hashPick(gameId, 'sos', SOS_CANDIDATES);
-}
-
-// Logs the pre-game prediction to the server-side ledger so it can be reconciled against the final
-// score later. Also logs the currently matched sportsbook price for the model's picked side
-// (selectionPrice): since this runs on every refresh cycle up to kickoff, the ledger's append-only
-// file naturally captures an opening (first logged) and closing (last logged before the game
-// starts) price per event, which the backtest script (src/backtest.js) uses for ROI and CLV.
-let lastPredictionWarning = 0;
-function postPrediction(game, prediction) {
-  if (game.completed || game.state !== 'pre' || !Number.isFinite(prediction.homeProbability)) return;
-  const price = bestPrice(game, prediction);
-  fetch(`/api/predictions?sport=${state.sport}`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ eventId: game.id, homeProbability: prediction.homeProbability, selection: prediction.selection, window: state.window, decay: prediction.provenance?.decay, sosWeight: prediction.provenance?.sosWeight, sample: prediction.sample, selectionPrice: price?.price }),
-  }).then((response) => {
-    if (!response.ok) throw new Error('Prediction was not saved');
-  }).catch(() => {
-    if (Date.now() - lastPredictionWarning < 60000) return;
-    lastPredictionWarning = Date.now();
-    toast('Prediction history was not saved. Check storage status before relying on the audit.');
-  });
+  return predictionSettings(gameId, state.calibration.get(state.sport)).sosWeight;
 }
 
 function applyPrediction(game, prediction) {
   state.predictions.set(game.id, prediction);
-  postPrediction(game, prediction);
 }
 
 function recomputePredictions() {

@@ -73,6 +73,31 @@ test('cloud audit and raw export use durable records; storage outages are explic
   assert.match((await response.json()).error, /storage unavailable/);
 });
 
+test('scheduled work requires its secret, reports trigger status and rejects browser prediction writes', async (context) => {
+  let runs = 0;
+  const token = 'fixture-background-token-at-least-32-characters';
+  const backgroundJobs = { run: async () => { runs += 1; }, status: () => ({ enabled: true, sports: ['nfl'] }) };
+  const server = createApp({}, { backgroundJobs, jobToken: token }).listen(0, '127.0.0.1');
+  context.after(() => new Promise((resolve) => server.close(resolve)));
+  await new Promise((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  assert.equal((await fetch(`${base}/api/jobs/scan`, { method: 'POST' })).status, 401);
+  assert.equal((await fetch(`${base}/api/jobs/scan`, { method: 'POST', headers: { Authorization: 'Bearer incorrect' } })).status, 401);
+  assert.equal(runs, 0);
+  const before = await (await fetch(`${base}/api/jobs/status`)).json();
+  assert.equal(before.lastExternalTriggerAt, null);
+  assert.equal(before.externalTriggerEnabled, true);
+  assert.equal((await fetch(`${base}/api/jobs/scan`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } })).status, 202);
+  const response = await fetch(`${base}/api/jobs/status`);
+  const after = await response.json();
+  assert.ok(after.lastExternalTriggerAt);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  assert.equal(runs, 1);
+  assert.doesNotMatch(JSON.stringify(after), /fixture-background-token/);
+  assert.equal((await fetch(`${base}/api/predictions?sport=nfl`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ eventId: '1', homeProbability: 0.6 }) })).status, 409);
+  assert.throws(() => createApp({}, { jobToken: 'short' }), /at least 32/);
+});
+
 test('injury reports normalize team/player details and cache the league endpoint', async () => {
   const urls = [];
   const feeds = createFeeds({ fetcher: async (url) => {

@@ -88,9 +88,11 @@ Browser -> same-origin Express proxy -> ESPN scoreboard / schedule / summary / i
 | `/api/summary` | `sport=nfl&event=<ESPN event ID>` | Box score, players, plays and win probability |
 | `/api/odds` | `sport=nfl` | Supported sportsbook moneylines |
 | `/api/markets` | `sport=wnba&event=<ESPN event ID>&market=player_points&window=20` | Per-event quotes and exact-line historical market analysis |
-| `/api/predictions` (POST) | `sport=nfl` + JSON body | Logs a pre-game moneyline prediction to the server-side ledger |
+| `/api/predictions` (POST) | `sport=nfl` + JSON body | Legacy route; returns 409 when the background scanner owns predictions |
 | `/api/predictions/stats` | `sport=nfl` | Reconciled prediction accuracy (Brier score, hit rate, calibration bias, best sample window) |
 | `/api/status` | None | Feed health and quota; never credentials |
+| `/api/jobs/status` | None | Background scan timestamps, leagues, counts, errors and last authenticated external trigger |
+| `/api/jobs/scan` (POST) | `Authorization: Bearer <BACKGROUND_JOB_TOKEN>` | Queues a background scan and returns 202; does not wait for completion |
 
 Schedules and selected game details poll every 30 seconds while the page is visible. Polling pauses while a dialog is open and can be switched off. There are no WebSocket or subsecond latency claims.
 
@@ -131,16 +133,18 @@ Historical frequency is not predictive accuracy. No backtested hit rate or profi
 
 ### Prediction ledger & calibration feedback loop
 
-Every pre-game moneyline prediction the browser computes is logged to a server-side, append-only ledger (`src/ledger.js`, persisted to `data/predictions.jsonl`, gitignored) via `POST /api/predictions`. Whenever any client polls `/api/scoreboard` and ESPN reports a logged event as complete, the server automatically reconciles that prediction against the final score — no separate cron job or timer is needed. A locked-in prediction is never overwritten once reconciled, so the ledger is an honest, unedited record of what the model said *before* the outcome was known. Writes are accepted only while ESPN reports the game as scheduled (`state: pre`), so live in-play odds never become a "closing" price. Games that drop off the live scoreboard before they could be settled there are swept from their own ESPN summary at most every 15 minutes per sport, once they are 4+ hours past kickoff. Reconciliation skips missing scores rather than settling them as 0-0, prices above 1001 (decimal) are discarded, a torn final line from a crash is repaired before the next append, and write failures are logged once per error code rather than swallowed.
+The server's `src/prediction-scanner.js` generates pre-game moneyline picks using the same `predictGame` and deterministic parameter selection as the browser, with a fixed 10-game window. It writes priced picks to the append-only ledger (`src/ledger.js`, Supabase when configured, otherwise the local JSONL file). Browser calculations are previews only: changing leagues, refreshing or switching to a 20-game window no longer posts predictions or creates Telegram alerts. The scanner runs at startup and every 10 minutes while the process is alive; see the Supabase Cron setup below to trigger real work on Render Free without an open browser.
+
+Results are reconciled from ESPN scoreboards every five minutes while running and during scheduled jobs. A settled prediction is never reopened. New predictions require both a future kickoff and ESPN's scheduled state. Missing odds, partial histories and insufficient samples are skipped rather than recorded as fabricated bets. Games that drop off the live scoreboard are checked through their ESPN summary at most every 15 minutes per sport once 4+ hours past kickoff. Missing scores never settle as 0-0, and database failures leave records retryable.
 
 `GET /api/predictions/stats?sport=nfl` exposes, per sport:
 
 - **Brier score** (0 = perfect, 1 = worst) and **favorite hit rate** over all reconciled predictions.
 - **Calibration bias** — the running average signed error (`model home probability - actual home result`) once at least 20 reconciled predictions exist. The browser subtracts this bias from every new home-win probability before display (`predictGame(..., biasFactor)` in `public/js/model.js`), so the model self-corrects a systematic lean (e.g. persistent home-team overconfidence) without a manual code change.
-- **Best-performing sample window** — Brier score is tracked separately for the 10-game and 20-game windows users select; once both windows have at least 15 reconciled samples, the lower-Brier window is surfaced as `bestWindow`.
+- **Best-performing sample window** — Brier score remains tracked separately for historical 10-game and 20-game records. New automated records use 10 games; changing the browser preview no longer adds a 20-game trial.
 - **Self-tuning recency decay** — Brier score is also tracked separately for each recency-decay value the model has used (see below); once at least two distinct decay values each have 15+ reconciled samples, the lower-Brier value is surfaced as `bestDecay`.
 
-This is visible in the app under API Feeds Status → **Model accuracy**. The ledger is intentionally simple (single JSONL file, in-memory index, no external database) and is shared across every visitor to a given deployment — it is not a per-user or authenticated record.
+This is visible in the app under API Feeds Status → **Model accuracy**. The append-only ledger uses Supabase in the hosted setup and an in-memory index for calibration. It is shared across visitors, not a per-user record.
 
 ### Self-enhancing recency weighting, Bayesian shrinkage & strength-of-schedule tuning
 
@@ -156,7 +160,7 @@ All three mechanics default to their original, pre-existing behavior (`decay = 1
 
 ### Backtesting (`src/backtest.js`)
 
-Every prediction the browser posts also carries `selectionPrice` — the decimal odds actually matched for whichever side the model favored — so the ledger's append-only file preserves the *first-ever logged snapshot* per event (the odds at the moment the model liked the pick, used as the assumed bet-placement price) and the *last-logged snapshot before resolution* (a proxy for the closing line), with no extra infrastructure required.
+Every prediction the server scanner records carries `selectionPrice`, matched to the model's selected side. The ledger preserves the first logged snapshot as the assumed bet-placement price and the last logged pre-game snapshot as a closing-line proxy. Odds refresh frequency limits the freshness of this proxy; it is not a guaranteed sportsbook closing quote.
 
 `node src/backtest.js [sport]` (or `npm run backtest [-- sport]`) reads `data/predictions.jsonl` and reports, over every resolved prediction with a matched price:
 
@@ -258,9 +262,34 @@ Keep the existing Git-connected Render Free web service and use a **Supabase Fre
 1. Create a Free project at <https://supabase.com/dashboard>. Run all of [supabase/schema.sql](supabase/schema.sql) in its SQL Editor. The tables have RLS enabled and no browser access; only the backend service role can use them.
 2. In Render's **Environment** settings, add `SUPABASE_URL` (your project's HTTPS URL), `SUPABASE_SECRET_KEY` (the server secret key, not a publishable/anon key), and `TRUST_PROXY=1`. A legacy `SUPABASE_SERVICE_ROLE_KEY` also works instead of the secret key. Keep these values out of Git, chat and browser code. Do not change your existing odds/Telegram settings.
 3. Deploy the updated code through your existing Git integration. The start command remains `npm start`. Startup restores the cloud ledger and Telegram outbox before listening. On Render, missing configuration or an unavailable database stops startup instead of falling back to temporary files.
-4. Open `/api/storage` on your deployed site: it should report `"backend":"supabase"` and `"durable":true`. Audit Lab shows **Supabase - durable history**. Record a real pre-game prediction, then confirm it remains in Audit Lab after a Render restart.
+4. Open `/api/storage` on your deployed site: it should report `"backend":"supabase"` and `"durable":true`. Audit Lab shows **Supabase - durable history**. Let the scanner capture a real priced pre-game prediction, then confirm it remains after a Render restart.
 
 With neither Supabase variable set, local development still uses the local JSONL file. Configuring only one variable is an error. Cloud mode never automatically imports the repository's bundled ledger; do not mistake old Git data or test data for production history.
+
+### Background Alerts With the Browser Closed
+
+Storage alone cannot run a sleeping server. Supabase Cron can make an authenticated request every 10 minutes to wake Render and trigger prediction scanning, result reconciliation and Telegram queue recovery. No paid worker is required. Both platforms' free quotas and availability limits still apply; cold starts, provider failures or project pauses can delay alerts. This is scheduled polling, not guaranteed real-time delivery.
+
+1. In Render, set `BACKGROUND_SCAN_SPORTS` to the leagues to scan, for example `nfl` or `mlb`. Default: `nfl` only. Supported values are comma-separated `nfl,nba,wnba,mlb,nhl`; EPL is excluded because the moneyline model does not support its three-way market. Browsing another league does not add it to the scanner.
+2. Set `BACKGROUND_JOB_TOKEN` in Render to a random secret of at least 32 characters. Generate it with a password manager and enter it directly into Render and Supabase Vault, not Git or chat. This is a separate secret from the Supabase service key. Deploy the updated code.
+3. In Supabase **Vault**, add `sportsstat_app_url` with your public app URL (for this deployment, `https://bet.auraagency.ca`) and `sportsstat_job_token` with exactly the same secret as Render's `BACKGROUND_JOB_TOKEN`.
+4. Run [supabase/background-jobs.sql](supabase/background-jobs.sql) in Supabase's SQL Editor. It enables `pg_cron`/`pg_net` and creates the named `sportsstat-background-scan` job. Re-running it updates that job rather than creating duplicates. The job reads the token from Vault at execution time; the token is not embedded in the cron command.
+5. Close the site and check again after the next scheduled run. `/api/jobs/status` should show advancing `lastExternalTriggerAt` and `lastCompletedAt` timestamps, `externalTriggerEnabled: true`, and the intended `sports`. `recorded` counts accepted snapshots in the most recent scan, not new Telegram messages. `errors` explains missing odds or upstream/storage failures. One alert per event is normal even after repeated scans.
+
+In Supabase **Cron**, use **Run Now** for an immediate check. An HTTP 202 means the job was accepted; use `/api/jobs/status` to verify completion. Cron's SQL success alone only means the HTTP request was queued. If the trigger timestamp never advances, inspect the HTTP response:
+
+```sql
+select id, status_code, timed_out, error_msg, created
+from net._http_response
+order by created desc
+limit 5;
+```
+
+A 401 means the two job tokens differ. A 503 means the trigger is not configured (or the host is unavailable). Enable the named job in the Cron dashboard after any project pause; do not assume paused free services will continue executing.
+
+**Odds budget:** start with one league and consider `ODDS_POLL_INTERVAL_MS=21600000` in Render (six hours). A continuously running one-league moneyline scan then needs at most roughly four successful odds refreshes per day per process, excluding restarts, failures and extra markets. Prices can be up to six hours old and new games may wait for the next odds refresh; this sacrifices freshness to conserve credits. The existing default is 30 minutes and can exhaust a free odds allowance under unattended use. More leagues, shorter intervals and props use more credits; monitor `/api/status` and your provider dashboard. No code upgrades a paid plan automatically.
+
+Do not run another server instance or a separate worker against the same notification outbox. The scheduled HTTP job targets the existing process, where overlapping scans are coalesced and scans are throttled to at most once every 10 minutes.
 
 ### Recover and Back Up
 
@@ -285,16 +314,16 @@ Use a new filename for each backup; the command refuses to overwrite an existing
 ### Runtime Behavior
 
 - Predictions and final results are acknowledged only after a successful database write. Failed results remain pending for reconciliation to retry. Unchanged prediction polls are skipped to conserve database space; changed snapshots are append-only.
-- Database read failures return an explicit error, not an empty calendar. Failed browser saves show a warning. Requests page through all stored records rather than truncating at Supabase's default row cap.
+- Database read failures return an explicit error, not an empty calendar. Failed scan writes appear in `/api/jobs/status`. Requests page through all stored records rather than truncating at Supabase's default row cap.
 - Telegram's pending messages and acknowledgements also use Supabase. Delivery remains at least once: a crash after Telegram accepts a message but before acknowledgement can still duplicate it.
-- Run one server instance per ledger/outbox. The model still records predictions when a browser computes them; a sleeping Render service does not generate new picks. Overdue recorded games are reconciled after wake-up. Durable history does not make free compute always-on.
+- Run one server instance per ledger/outbox. The server generates picks without browser activity. Configure Supabase Cron above to wake Render Free for scheduled work; local timers alone cannot run while the service sleeps. Overdue recorded games are reconciled after wake-up.
 - Bet Tracker's manually entered personal slips remain browser-local; this change protects the shared prediction ledger used by Audit Lab and backtests.
 
 ## Before Public Production Use
 
 This is a working, production-minded starter, not a certified production betting system. In particular:
 
-- `POST /api/predictions` is unauthenticated, so on a public deployment anyone can write pre-game predictions for scheduled events into the shared ledger and skew its audit/backtest statistics. Put the deployment behind authentication, or move prediction generation server-side, before trusting the ledger. Telegram announces each event at most once to limit alert spam.
+- Production startup assigns predictions to the server scanner and rejects legacy browser writes with HTTP 409. The scheduled trigger requires a private bearer token. Audit/export remain shared public read endpoints: add authentication if the deployment should be private. Telegram announces each event at most once.
 - Configure Supabase for ephemeral hosts as described above. Local-file mode is not durable on Render and is blocked there. Run exactly one server process per ledger/outbox; two processes would each reconcile and notify independently.
 - Behind a reverse proxy, set `TRUST_PROXY=1` so the API rate limit applies per client instead of to the proxy as a whole.
 

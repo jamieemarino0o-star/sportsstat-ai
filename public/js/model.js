@@ -132,6 +132,19 @@ export function historicalTrend(events, teamId, before = new Date().toISOString(
   };
 }
 
+export function predictionSettings(gameId, stats = {}) {
+  const pick = (salt, candidates) => {
+    let hash = 0;
+    for (const character of `${salt}:${gameId}`) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+    return candidates[hash % candidates.length];
+  };
+  return {
+    biasFactor: Number.isFinite(stats.biasFactor) ? stats.biasFactor : 0,
+    decay: Number.isFinite(stats.bestDecay) ? stats.bestDecay : pick('decay', [1, 0.85]),
+    sosWeight: Number.isFinite(stats.bestSosWeight) ? stats.bestSosWeight : pick('sos', [0, 0.125, 0.25, 0.375, 0.5]),
+  };
+}
+
 export function predictGame(game, homeHistory, awayHistory, window = 10, biasFactor = 0, decay = 1, sosWeight = SOS_WEIGHT) {
   const cutoff = new Date(Math.min(Date.now(), new Date(game.date).getTime())).toISOString();
   const home = historicalTrend(homeHistory, game.home.id, cutoff, window, decay, sosWeight);
