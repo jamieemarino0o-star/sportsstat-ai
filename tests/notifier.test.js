@@ -17,9 +17,11 @@ test('message formats match the required templates', () => {
   assert.equal(newBetMessageFromEntry(pick), '🚀 New Bet Detected!\nMatch: Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 1, 2026, 8:15 PM EDT\nPick: Buffalo Bills\nModel pick probability: 60.0%\nOdds: 1.90\nEV: +14.0%');
   assert.ok(Math.abs(expectedValuePercent({ ...pick, selection: 'away', selectionPrice: 2 }) - -20) < 1e-9);
   const won = resultMessageFromEntry({ ...pick, resolved: true, homeScore: 24, awayScore: 16 });
-  assert.equal(won, '🏁 Final Result - Los Angeles Chargers @ Buffalo Bills\nGame time: Oct 1, 2026, 8:15 PM EDT\nSettled: Oct 1, 2026, 11:30 PM EDT\nModel pick probability: 60.0%\nWinner: Buffalo Bills\nStatus: ✅ Won (Final 16-24)');
-  assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 10, awayScore: 20 }), /Winner: Los Angeles Chargers\nStatus: ❌ Lost/);
-  assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 1, awayScore: 1 }), /Winner: Draw\nStatus: Push/);
+  assert.equal(won, '🏁 Final Result - NFL\nLos Angeles Chargers @ Buffalo Bills\n✅ Won Buffalo Bills\n🥇 (Final 16-24)\nOpening Odds 1.90\nGame time: Oct 1, 2026, 8:15 PM\nModel pick probability: 60.0%');
+  assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 10, awayScore: 20 }), /\n❌ Lost Buffalo Bills\n🥇 \(Final 20-10\)/);
+  assert.match(resultMessageFromEntry({ ...pick, resolved: true, homeScore: 1, awayScore: 1 }), /\n➖ Push Buffalo Bills\n/);
+  const fromOpening = resultMessageFromEntry({ ...pick, selection: 'away', selectionPrice: 3, homeScore: 24, awayScore: 16, opening: { ...pick, selectionPrice: 2.27 } });
+  assert.match(fromOpening, /✅ Won Buffalo Bills\n🥇 \(Final 16-24\)\nOpening Odds 2.27\n/);
 });
 
 test('notifications show the selected side probability and omit detection dates', () => {
@@ -36,7 +38,7 @@ test('notifications show the selected side probability and omit detection dates'
 
 test('notification timestamps handle local date boundaries, DST and missing dates', () => {
   assert.match(newBetMessageFromEntry(pick, { timeZone: 'America/New_York' }), /Game time: Oct 1, 2026, 8:15 PM EDT/);
-  assert.match(resultMessageFromEntry({ ...pick, homeScore: 24, awayScore: 16 }, { timeZone: 'America/New_York' }), /Settled: Oct 1, 2026, 11:30 PM EDT/);
+  assert.match(resultMessageFromEntry({ ...pick, homeScore: 24, awayScore: 16 }, { timeZone: 'America/New_York' }), /Game time: Oct 1, 2026, 8:15 PM\n/);
   assert.equal(formatNotificationTime('2026-12-02T00:15:00Z', 'America/New_York'), 'Dec 1, 2026, 7:15 PM EST');
   assert.equal(formatNotificationTime('2026-12-02T00:15:00Z'), 'Dec 1, 2026, 7:15 PM EST');
   for (const value of [undefined, null, '', 'not-a-date']) assert.equal(formatNotificationTime(value), 'Not available');
@@ -49,7 +51,8 @@ test('notifier applies configured time zone to both notification types', async (
   const notifier = createTelegramNotifier({ token: 't', chatId: 'c', minEv: null, fetcher: fakeFetch(calls), gapMs: 0, timeZone: 'America/New_York' });
   await notifier.notifyNewBet(pick);
   await notifier.notifyResult({ ...pick, resolved: true, homeScore: 24, awayScore: 16 });
-  assert.ok(calls.every((call) => call.body.text.includes('Game time: Oct 1, 2026, 8:15 PM EDT')));
+  assert.match(calls[0].body.text, /Game time: Oct 1, 2026, 8:15 PM EDT/);
+  assert.match(calls[1].body.text, /Game time: Oct 1, 2026, 8:15 PM\n/);
 });
 
 test('sender skips without credentials and reports API errors without throwing', async () => {
@@ -84,9 +87,9 @@ test('ledger announces each new bet once and each final result once', async () =
   ledger.reconcile('nfl', [game]);
   ledger.reconcile('nfl', [game]);
   await notifier.flush();
-  assert.deepEqual(calls.map((call) => call.body.text.split('\n')[0]), ['🚀 New Bet Detected!', '🏁 Final Result - Los Angeles Chargers @ Buffalo Bills']);
+  assert.deepEqual(calls.map((call) => call.body.text.split('\n')[0]), ['🚀 New Bet Detected!', '🏁 Final Result - NFL']);
   assert.match(calls[0].body.text, /Pick: Buffalo Bills/);
-  assert.match(calls[1].body.text, /Status: ❌ Lost/); // graded on the latest (flipped) pick
+  assert.match(calls[1].body.text, /✅ Won Buffalo Bills\n🥇 \(Final 16-24\)\nOpening Odds 1.90\n/); // graded on the announced pick, not the later flip
 });
 
 test('a failing notifier never breaks the ledger', () => {

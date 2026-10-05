@@ -25,6 +25,8 @@ function actualOutcome(home, away) {
 // notifyResult(entry) when that event is reconciled. Notifier failures never affect the ledger.
 export function createLedger({ file = null, notifier = null, logger = console, records = [], persist = null } = {}) {
   const entries = new Map(); // key: `${sport}:${eventId}`
+  const openings = new Map(); // first priced pick per event (the announced bet), used for result notifications
+  const priced = (record) => Boolean(record.selection && record.selectionPrice > 1);
   // A crash or full disk mid-write can leave a final line without its newline; the next append would
   // then be glued onto it and both records lost. Tracked so append() can terminate a torn tail first.
   let needsNewline = false;
@@ -46,7 +48,10 @@ export function createLedger({ file = null, notifier = null, logger = console, r
       const key = `${record.sport}:${record.eventId}`;
       // Settled results are final: a stray later prediction line (e.g. written by a second server
       // process sharing the file) must not reopen a resolved event.
-      if (record.type === 'prediction') { if (!entries.get(key)?.resolved) entries.set(key, { ...record }); }
+      if (record.type === 'prediction') {
+        if (!openings.has(key) && priced(record)) openings.set(key, { ...record });
+        if (!entries.get(key)?.resolved) entries.set(key, { ...record });
+      }
       else if (record.type === 'result') {
         const existing = entries.get(key);
         if (existing) entries.set(key, { ...existing, ...record });
@@ -105,6 +110,7 @@ export function createLedger({ file = null, notifier = null, logger = console, r
     entry.announced = Boolean(existing?.announced || announceNow);
     const commit = () => {
       entries.set(key, entry);
+      if (!openings.has(key) && priced(entry)) openings.set(key, entry);
       if (announceNow) notify('notifyNewBet', entry);
       return entry;
     };
@@ -132,7 +138,7 @@ export function createLedger({ file = null, notifier = null, logger = console, r
       const commit = () => {
         entries.set(key, updated);
         resolvedNow.push(updated);
-        notify('notifyResult', updated);
+        notify('notifyResult', { ...updated, opening: openings.get(key) });
       };
       const saved = append(result);
       if (persist) writes.push(Promise.resolve(saved).then(commit));
@@ -160,6 +166,7 @@ export function createLedger({ file = null, notifier = null, logger = console, r
       const excess = keys.length - MAX_ENTRIES_PER_SPORT;
       for (let index = 0; index < excess; index += 1) entries.delete(keys[index]);
     }
+    for (const key of openings.keys()) if (!entries.has(key)) openings.delete(key);
   }
 
   function summarize(list) {

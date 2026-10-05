@@ -28,11 +28,11 @@ export function expectedValuePercent(entry) {
   return (pickProbability(entry) * entry.selectionPrice - 1) * 100;
 }
 
-export function formatNotificationTime(value, timeZone = QUEBEC_TIME_ZONE) {
+export function formatNotificationTime(value, timeZone = QUEBEC_TIME_ZONE, { zoneLabel = true } = {}) {
   if (!value || Number.isNaN(Date.parse(value))) return 'Not available';
   return new Intl.DateTimeFormat('en-US', {
     timeZone, month: 'short', day: 'numeric', year: 'numeric',
-    hour: 'numeric', minute: '2-digit', timeZoneName: 'short',
+    hour: 'numeric', minute: '2-digit', ...(zoneLabel ? { timeZoneName: 'short' } : {}),
   }).format(new Date(value));
 }
 
@@ -40,8 +40,8 @@ export function formatNewBetMessage({ match, pick, odds, ev, probability = 'Not 
   return `🚀 New Bet Detected!\nMatch: ${match}\nGame time: ${gameTime}\nPick: ${pick}\nModel pick probability: ${probability}\nOdds: ${odds}\nEV: ${ev}%`;
 }
 
-export function formatResultMessage({ match, winner, status, probability = 'Not available', gameTime = 'Not available', settledAt = 'Not available' }) {
-  return `🏁 Final Result - ${match}\nGame time: ${gameTime}\nSettled: ${settledAt}\nModel pick probability: ${probability}\nWinner: ${winner}\nStatus: ${status}`;
+export function formatResultMessage({ league, match, status, score, openingOdds = 'n/a', probability = 'Not available', gameTime = 'Not available' }) {
+  return `🏁 Final Result - ${league}\n${match}\n${status}\n🥇 (${score})\nOpening Odds ${openingOdds}\nGame time: ${gameTime}\nModel pick probability: ${probability}`;
 }
 
 export function newBetMessageFromEntry(entry, { timeZone = QUEBEC_TIME_ZONE } = {}) {
@@ -56,19 +56,24 @@ export function newBetMessageFromEntry(entry, { timeZone = QUEBEC_TIME_ZONE } = 
   });
 }
 
+// Grades the first priced pick (the announced bet), not later side flips.
 export function resultMessageFromEntry(entry, { timeZone = QUEBEC_TIME_ZONE } = {}) {
-  const draw = entry.homeScore === entry.awayScore;
-  const winner = draw ? 'Draw' : entry.homeScore > entry.awayScore ? entry.homeTeam : entry.awayTeam;
-  const score = `Final ${entry.awayScore}-${entry.homeScore}`;
+  const { opening, ...settled } = entry;
+  const bet = { ...settled, ...(opening ? { selection: opening.selection, homeProbability: opening.homeProbability, selectionPrice: opening.selectionPrice } : {}) };
+  const draw = bet.homeScore === bet.awayScore;
+  const winner = draw ? null : bet.homeScore > bet.awayScore ? bet.homeTeam : bet.awayTeam;
+  const pick = pickTeam(bet);
   let status;
-  if (!entry.selection) status = `No pick (${score})`;
-  else if (draw) status = `Push (${score})`;
-  else status = `${winner === pickTeam(entry) ? '✅ Won' : '❌ Lost'} (${score})`;
+  if (!pick) status = 'No pick';
+  else if (draw) status = `➖ Push ${pick}`;
+  else status = `${winner === pick ? '✅ Won' : '❌ Lost'} ${pick}`;
   return formatResultMessage({
-    match: matchLabel(entry), winner: winner || 'n/a', status,
-    gameTime: formatNotificationTime(entry.gameDate, timeZone),
-    settledAt: formatNotificationTime(entry.resolvedAt, timeZone),
-    probability: probabilityLabel(entry),
+    league: String(bet.sport || '').toUpperCase() || 'n/a',
+    match: matchLabel(bet), status,
+    score: `Final ${bet.awayScore}-${bet.homeScore}`,
+    openingOdds: Number.isFinite(bet.selectionPrice) && bet.selectionPrice > 1 ? formatDecimalOdds(bet.selectionPrice) : 'n/a',
+    gameTime: formatNotificationTime(bet.gameDate, timeZone, { zoneLabel: false }),
+    probability: probabilityLabel(bet),
   });
 }
 
@@ -151,7 +156,9 @@ export function createTelegramNotifier({
         const announced = group.predictions.find((entry) => entry.announced && entry.selection && entry.selectionPrice > 1);
         if (announced) await notifier.notifyNewBet(announced);
         if (group.result && group.predictions.length) {
-          await notifier.notifyResult({ ...group.predictions.at(-1), ...group.result });
+          const opening = [...group.predictions].sort((first, second) => new Date(first.updatedAt || first.loggedAt) - new Date(second.updatedAt || second.loggedAt))
+            .find((entry) => entry.selection && entry.selectionPrice > 1);
+          await notifier.notifyResult({ ...group.predictions.at(-1), ...group.result, opening });
         }
       }
       const rows = buildLedgerRows(groups, { limit: Infinity });
