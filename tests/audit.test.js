@@ -162,3 +162,23 @@ test('yesterday stays 3/3 after a cloud restore and 600 new predictions beyond t
   assert.equal(report.history.length, 500);
   assert.deepEqual(report.calendar.days, before);
 });
+
+test('month filter scopes every metric and the history while keeping the full calendar', async () => {
+  const records = [];
+  const ledger = createLedger({ persist: async (record) => { records.push(record); } });
+  const games = [['1', '2026-09-20T18:00:00Z', 3, 1], ['2', '2026-09-21T18:00:00Z', 3, 1], ['3', '2026-10-01T03:30:00Z', 1, 3], ['4', '2026-10-05T18:00:00Z', 3, 1]];
+  for (const [id, gameDate, home, away] of games) {
+    await ledger.record({ sport: 'nfl', eventId: id, gameDate, homeProbability: 0.6, selection: 'home', selectionPrice: 2 });
+    await ledger.reconcile('nfl', [{ id, completed: true, home: { score: home }, away: { score: away } }]);
+  }
+  const september = auditReport(records, { month: '2026-09', timeZone: 'America/Toronto' });
+  // Game 3 kicks off Sept 30 at 11:30 PM in Toronto, so it belongs to September there.
+  assert.deepEqual([september.sample, september.winRate.wins, september.winRate.losses, september.history.length], [3, 2, 1, 3]);
+  assert.equal(september.month, '2026-09');
+  const october = auditReport(records, { month: '2026-10', timeZone: 'America/Toronto' });
+  assert.deepEqual([october.sample, october.winRate.winRate, october.roi.roi], [1, 1, 1]);
+  assert.equal(october.calendar.days.length, 4);
+  assert.deepEqual(october.history[0].risk, { tier: 'medium', byOdds: 'medium', mispriced: false });
+  assert.equal(october.history[0].pickProbability, 0.6);
+  assert.equal(auditReport(records, { month: 'bad' }).sample, 4);
+});

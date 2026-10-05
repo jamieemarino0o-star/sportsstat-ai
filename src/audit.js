@@ -111,9 +111,12 @@ export function buildLedgerRows(groups, { sport = null, limit = 500 } = {}) {
     if (sport && opening.sport !== sport) continue;
     const result = group.result;
     const gameDate = result?.gameDate || [...chronological].reverse().find((entry) => entry.gameDate)?.gameDate || null;
+    const pickProbability = opening.selection === 'home' ? opening.homeProbability : opening.selection === 'away' ? 1 - opening.homeProbability : null;
+    const risk = opening.selection ? classifyRisk(pickProbability, opening.selectionPrice) : null;
     rows.push({
       key, sport: opening.sport, eventId: opening.eventId, homeTeam: opening.homeTeam, awayTeam: opening.awayTeam,
-      selection: opening.selection, homeProbability: opening.homeProbability,
+      selection: opening.selection, homeProbability: opening.homeProbability, pickProbability,
+      risk: risk?.tier ? { tier: risk.tier, byOdds: risk.byOdds, mispriced: risk.mispriced } : null,
       openingPrice: opening.selectionPrice ?? null, closingPrice: closing.selectionPrice ?? null,
       window: opening.window, decay: opening.decay, sosWeight: opening.sosWeight,
       resolved: Boolean(result?.resolved), homeScore: result?.homeScore ?? null, awayScore: result?.awayScore ?? null,
@@ -209,13 +212,25 @@ export function generateInsights(result, { currentKellyFraction = 0.25 } = {}) {
 // file once, runs the full backtest (ROI/Brier/CLV/drawdown/stratification/Kelly grid), adds win
 // rate and walk-forward validation, generates plain-English insights from all of it, and returns
 // the interactive ledger history grid rows -- everything the Audit Lab page needs in one call.
-export function auditReport(file, { sport = null, kellyFraction = 0.25, historyLimit = 500, timeZone = 'UTC' } = {}) {
+export function isValidMonth(month) {
+  return typeof month === 'string' && /^20\d{2}-(0[1-9]|1[0-2])$/.test(month);
+}
+
+// Same date the calendar uses: game date, falling back to resolution or logging time.
+function groupDay(group, timeZone) {
+  const gameDate = group.result?.gameDate || [...group.predictions].reverse().find((entry) => entry.gameDate)?.gameDate;
+  return dayKey(gameDate || group.result?.resolvedAt || group.predictions[0]?.loggedAt, timeZone);
+}
+
+export function auditReport(file, { sport = null, kellyFraction = 0.25, historyLimit = 500, timeZone = 'UTC', month = null } = {}) {
   const zone = isValidTimeZone(timeZone) ? timeZone : 'UTC';
-  const groups = readLedgerFile(file);
+  const selectedMonth = isValidMonth(month) ? month : null;
+  const allGroups = readLedgerFile(file);
+  const groups = selectedMonth ? new Map([...allGroups].filter(([, group]) => group.predictions.length && groupDay(group, zone)?.startsWith(selectedMonth))) : allGroups;
   const trials = buildTrials(groups, { sport });
   const backtest = runBacktest(trials);
   const result = {
-    sport, generatedAt: new Date().toISOString(), ...backtest, winRate: computeWinRate(trials), walkForward: walkForwardValidation(trials),
+    sport, month: selectedMonth, generatedAt: new Date().toISOString(), ...backtest, winRate: computeWinRate(trials), walkForward: walkForwardValidation(trials),
     byRiskTier: attachWinRates(backtest.byRiskTier, trials, (trial) => classifyRisk(trial.modelProbability, trial.openingPrice)?.tier ?? null),
     byOddsBracket: attachWinRates(backtest.byOddsBracket, trials, (trial) => oddsBracket(trial.openingPrice)),
     bySport: attachWinRates(backtest.bySport, trials, (trial) => trial.sport),
@@ -223,7 +238,7 @@ export function auditReport(file, { sport = null, kellyFraction = 0.25, historyL
   const allRows = buildLedgerRows(groups, { sport, limit: Infinity });
   return {
     ...result, insights: generateInsights(result, { currentKellyFraction: kellyFraction }), history: allRows.slice(0, historyLimit),
-    calendar: { timeZone: zone, days: buildWinCalendar(allRows, { timeZone: zone }) },
+    calendar: { timeZone: zone, days: buildWinCalendar(selectedMonth ? buildLedgerRows(allGroups, { sport, limit: Infinity }) : allRows, { timeZone: zone }) },
   };
 }
 

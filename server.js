@@ -7,7 +7,7 @@ import { resolve } from 'node:path';
 import { createFeeds, SPORTS } from './src/feeds.js';
 import { createLedger } from './src/ledger.js';
 import { createTelegramNotifier } from './src/notifier.js';
-import { auditReport, isValidTimeZone } from './src/audit.js';
+import { auditReport, isValidMonth, isValidTimeZone } from './src/audit.js';
 import { SPORT_MARKETS } from './public/js/markets.js';
 import { createHistoryStore, readLocalRecords } from './src/history-store.js';
 import { createPredictionScanner } from './src/prediction-scanner.js';
@@ -112,7 +112,8 @@ export function createApp(feeds = createFeeds(), { historyStore = null, backgrou
     // ?tz= is the viewer's IANA time zone so the win calendar buckets games by their local date.
     const timeZone = typeof req.query.tz === 'string' && req.query.tz.length <= 64 && isValidTimeZone(req.query.tz) ? req.query.tz : 'UTC';
     const source = historyStore ? await historyStore.readRecords() : LEDGER_FILE;
-    res.json({ ...auditReport(source, { sport, timeZone, kellyFraction: Number.isFinite(kellyFraction) && kellyFraction > 0 && kellyFraction <= 1 ? kellyFraction : 0.25 }), storage: storageStatus() });
+    const month = isValidMonth(req.query.month) ? req.query.month : null;
+    res.json({ ...auditReport(source, { sport, timeZone, month, kellyFraction: Number.isFinite(kellyFraction) && kellyFraction > 0 && kellyFraction <= 1 ? kellyFraction : 0.25 }), storage: storageStatus() });
   });
   app.use('/api', (req, res, next) => {
     res.set('Cache-Control', 'no-store');

@@ -9,6 +9,8 @@ const WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const viewerTimeZone = () => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; } catch { return 'UTC'; } };
 const dayKey = (value, timeZone) => value && !Number.isNaN(Date.parse(value)) ? new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date(value)) : null;
 
+const monthLabel = (month) => { const [year, index] = month.split('-').map(Number); return new Intl.DateTimeFormat('en-US', { month: 'long', year: 'numeric', timeZone: 'UTC' }).format(new Date(Date.UTC(year, index - 1, 1))); };
+
 // "Oct 1, 2026 - 8:15 PM" in the viewer's time zone.
 function gameTime(value, timeZone) {
   if (!value || Number.isNaN(Date.parse(value))) return null;
@@ -32,11 +34,11 @@ function readKellyFraction() {
   return [0.25, 0.5].includes(stored) ? stored : 0.25;
 }
 
-export function createAuditWorkspace({ state, api, render, icons, toast }) {
+export function createAuditWorkspace({ state, api, render, icons, toast, openDialog }) {
   const ui = { loading: false, error: '', data: null, sport: 'all', strata: 'byRiskTier', search: '', outcome: 'all', month: null, day: null, controller: null, request: 0 };
 
   async function load(force = false) {
-    if (!force && ui.data && ui.data.sport === (ui.sport === 'all' ? null : ui.sport)) return;
+    if (!force && ui.data && ui.data.sport === (ui.sport === 'all' ? null : ui.sport) && ui.data.month === ui.month) return;
     ui.controller?.abort();
     ui.controller = new AbortController();
     const request = ++ui.request;
@@ -44,12 +46,15 @@ export function createAuditWorkspace({ state, api, render, icons, toast }) {
     ui.error = '';
     render();
     try {
-      const query = ui.sport === 'all' ? '' : `&sport=${ui.sport}`;
+      const query = `${ui.sport === 'all' ? '' : `&sport=${ui.sport}`}${ui.month ? `&month=${ui.month}` : ''}`;
       const data = await api(`audit?kellyFraction=${readKellyFraction()}&tz=${encodeURIComponent(viewerTimeZone())}${query}`, ui.controller.signal);
       if (request !== ui.request) return;
-      ui.data = data;
       // Open on the most recent month with settled picks (or the current month when there are none).
-      if (!ui.month) ui.month = (data.calendar?.days.at(-1)?.date || dayKey(new Date().toISOString(), data.calendar?.timeZone || 'UTC')).slice(0, 7);
+      if (!ui.month) {
+        ui.month = (data.calendar?.days.at(-1)?.date || dayKey(new Date().toISOString(), data.calendar?.timeZone || 'UTC')).slice(0, 7);
+        return void load(true);
+      }
+      ui.data = data;
       if (ui.day && !data.calendar?.days.some((day) => day.date === ui.day)) ui.day = null;
     } catch (error) {
       if (request === ui.request && error.name !== 'AbortError') ui.error = error.message;
@@ -67,11 +72,12 @@ export function createAuditWorkspace({ state, api, render, icons, toast }) {
   }
 
   function renderKpis(data) {
+    const scope = `${data.sport ? data.sport.toUpperCase() : 'All sports'}${data.month ? ` · ${monthLabel(data.month)}` : ''}`;
     const items = [
       ['Total ROI', percent(data.roi.roi, 2), `${data.roi.bets} decisive bets`, 'chart-no-axes-combined'],
       ['Win rate', percent(data.winRate.winRate), `${data.winRate.wins}W / ${data.winRate.losses}L`, 'target'],
       ['Brier score', Number.isFinite(data.brier) ? data.brier.toFixed(4) : '--', '0 = perfect, 1 = worst', 'crosshair'],
-      ['Sample size', String(data.sample), data.sport ? data.sport.toUpperCase() : 'All sports', 'database'],
+      ['Sample size', String(data.sample), scope, 'database'],
     ];
     return `<section class="metrics">${items.map(([label, value, note, symbol]) => `<article class="metric"><div class="metric-top"><span>${label}</span>${icon(symbol)}</div><div class="metric-value">${value}</div><div class="metric-bottom">${note}</div></article>`).join('')}</section>`;
   }
@@ -80,7 +86,7 @@ export function createAuditWorkspace({ state, api, render, icons, toast }) {
     const rows = [
       ['Closing Line Value', data.clv ? `${percent(data.clv.averageClv, 2)} avg · beats close ${percent(data.clv.beatCloseRate)} of the time (n=${data.clv.sample})` : 'No trials with both an opening and closing price yet'],
       ['Max drawdown', `${data.drawdown.maxDrawdown.toFixed(2)}u (${percent(data.drawdown.maxDrawdownPct)}) from a ${data.drawdown.startingBankroll}u starting bankroll`],
-      ['Walk-forward validation', data.walkForward.windows.length ? `${data.walkForward.windows.length} rolling windows of ${data.walkForward.windowSize} · drift ${data.walkForward.drift >= 0 ? '+' : ''}${data.walkForward.drift.toFixed(4)} (recent vs. earliest Brier)` : `Needs ${data.walkForward.windowSize}+ resolved trials (currently ${data.walkForward.sample})`],
+      ['Walk-forward validation', data.walkForward.windows.length ? `${data.walkForward.windows.length} rolling window${data.walkForward.windows.length === 1 ? '' : 's'} of ${data.walkForward.windowSize} · ${Number.isFinite(data.walkForward.drift) ? `drift ${data.walkForward.drift >= 0 ? '+' : ''}${data.walkForward.drift.toFixed(4)} (recent vs. earliest Brier)` : 'drift needs a second window'}` : `Needs ${data.walkForward.windowSize}+ resolved trials (currently ${data.walkForward.sample})`],
       ['Fractional Kelly grid search', data.kellyGrid.grid.length ? `Recommends ${data.kellyGrid.recommendedFraction} fraction (n=${data.kellyGrid.sample}, capped at 40% max drawdown)` : `Needs ${data.kellyGrid.minSample}+ decisive priced trials (currently ${data.kellyGrid.sample})`],
     ];
     return `<section class="status-table"><h2>Portfolio detail</h2><div class="table-container"><table class="signal-table"><tbody>${rows.map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(value)}</td></tr>`).join('')}</tbody></table></div></section>`;
@@ -141,6 +147,33 @@ export function createAuditWorkspace({ state, api, render, icons, toast }) {
     return `<span class="outcome-pill ${row.pickResult}">${row.pickResult.toUpperCase()}</span>`;
   }
 
+  function riskTag(row) {
+    const risk = row.risk;
+    if (!risk?.tier) return '<span class="no-value">--</span>';
+    const title = risk.mispriced ? `Model rates this ${risk.tier}-risk, but the market's odds imply ${risk.byOdds}-risk` : `Model and market agree: ${risk.tier}-risk`;
+    return `<span class="risk-tag risk-${escapeHtml(risk.tier)}" title="${escapeHtml(title)}">${escapeHtml(risk.tier)}${risk.mispriced ? ' ⚠' : ''}</span>`;
+  }
+
+  const pickName = (row) => row.selection === 'home' ? row.homeTeam || 'Home' : row.selection === 'away' ? row.awayTeam || 'Away' : null;
+  // Flat 1-unit stake at the opening price, as in the backtest.
+  const units = (row) => row.pickResult === 'win' && row.openingPrice > 1 ? row.openingPrice - 1 : row.pickResult === 'loss' ? -1 : 0;
+
+  function openDayDialog(date) {
+    const data = ui.data;
+    if (!data || !openDialog) return;
+    const timeZone = data.calendar?.timeZone || viewerTimeZone();
+    const rows = (data.history || []).filter((row) => row.resolved && row.pickResult && dayKey(row.gameDate || row.resolvedAt || row.loggedAt, timeZone) === date)
+      .sort((first, second) => new Date(first.gameDate || 0) - new Date(second.gameDate || 0));
+    const day = data.calendar?.days.find((entry) => entry.date === date);
+    const priced = rows.filter((row) => row.openingPrice > 1);
+    const profit = priced.reduce((sum, row) => sum + units(row), 0);
+    const decided = priced.filter((row) => row.pickResult !== 'push').length;
+    const heading = gameTime(`${date}T12:00:00Z`, 'UTC')?.split(' - ')[0] || date;
+    const summary = day ? `${day.fraction} won${day.decided ? ` (${percent(day.winRate)})` : ''}${day.pushes ? ` · ${day.pushes} push${day.pushes > 1 ? 'es' : ''}` : ''}` : 'No settled picks';
+    const table = rows.length ? `<div class="table-container"><table class="signal-table"><thead><tr><th>Matchup</th><th>Pick</th><th>Pick prob.</th><th>Risk</th><th>Opening odds</th><th>Final (away - home)</th><th>Outcome</th><th>Units</th></tr></thead><tbody>${rows.map((row) => `<tr><td>${escapeHtml(row.sport?.toUpperCase())} · ${escapeHtml(row.awayTeam || '--')} @ ${escapeHtml(row.homeTeam || '--')}${renderGameTime(row, data)}</td><td>${escapeHtml(pickName(row) || '--')}</td><td>${percent(row.pickProbability)}</td><td>${riskTag(row)}</td><td>${row.openingPrice ? row.openingPrice.toFixed(2) : '--'}</td><td>${row.awayScore} - ${row.homeScore}</td><td>${outcomePill(row)}</td><td class="${units(row) > 0 ? 'profit-positive' : units(row) < 0 ? 'profit-negative' : ''}">${row.openingPrice > 1 ? `${units(row) >= 0 ? '+' : ''}${units(row).toFixed(2)}u` : '--'}</td></tr>`).join('')}</tbody></table></div>` : `<div class="empty-state">${icon('receipt-text')}<h3>No settled bets</h3><p>No settled picks were found for this day in the loaded report.</p></div>`;
+    openDialog(`Results · ${heading}`, `<div class="inspection-subtitle day-results"><span class="small-tag">${escapeHtml(data.sport ? data.sport.toUpperCase() : 'All sports')} · ${escapeHtml(timeZone)}</span><h3>${escapeHtml(summary)}</h3><p>${rows.length} settled bet${rows.length === 1 ? '' : 's'}${priced.length ? ` · ${profit >= 0 ? '+' : ''}${profit.toFixed(2)}u flat-stake profit${decided ? ` (${percent(profit / decided, 1)} ROI)` : ''}` : ''}</p></div>${table}<p class="table-footnote">${icon('info')}Graded on the opening pick and price, 1 unit per bet. Risk is the model's tier for the pick; ⚠ means the odds imply a different tier.</p>`);
+  }
+
   function renderHistory(data) {
     return `<section class="status-table"><div class="section-heading"><div class="section-title">${icon('list')}<h2>Ledger history</h2></div><button class="button button-secondary" data-audit-export>${icon('download')}Export JSON</button></div><div class="audit-toolbar"><div class="audit-search"><label class="search-box">${icon('search')}<input type="search" data-audit-search value="${escapeHtml(ui.search)}" placeholder="Search team, sport or event ID..." aria-label="Search ledger history"></label><select data-audit-outcome aria-label="Filter by outcome"><option value="all" ${ui.outcome === 'all' ? 'selected' : ''}>All predictions</option><option value="resolved" ${ui.outcome === 'resolved' ? 'selected' : ''}>Resolved only</option><option value="pending" ${ui.outcome === 'pending' ? 'selected' : ''}>Pending only</option><option value="win" ${ui.outcome === 'win' ? 'selected' : ''}>Wins</option><option value="loss" ${ui.outcome === 'loss' ? 'selected' : ''}>Losses</option></select></div></div>${ui.day ? `<div class="calendar-filter"><span>${icon('calendar-check')}Showing games on ${escapeHtml(gameTime(`${ui.day}T12:00:00Z`, 'UTC')?.split(' - ')[0] || ui.day)}</span><button class="button button-secondary" data-calendar-clear>${icon('x')}Clear day</button></div>` : ''}<div id="audit-history-body">${renderHistoryBody(data)}</div></section>`;
   }
@@ -159,7 +192,7 @@ export function createAuditWorkspace({ state, api, render, icons, toast }) {
 
   function renderHistoryBody(data) {
     const rows = filteredHistory(data);
-    return rows.length ? `<div class="table-container"><table class="signal-table"><thead><tr><th>Matchup</th><th>Selection</th><th>Model prob.</th><th>Opening / closing odds</th><th>Result (away - home)</th><th>Outcome</th></tr></thead><tbody>${rows.slice(0, 200).map((row) => `<tr><td>${escapeHtml(row.sport?.toUpperCase())} · ${escapeHtml(row.awayTeam || '--')} @ ${escapeHtml(row.homeTeam || '--')}${renderGameTime(row, data)}<small class="cell-note">Event ${escapeHtml(row.eventId)} · logged ${escapeHtml(timestamp(row.loggedAt))}</small></td><td>${row.selection ? escapeHtml(row.selection === 'home' ? row.homeTeam || 'Home' : row.awayTeam || 'Away') : '<span class="no-value">--</span>'}</td><td>${percent(row.homeProbability)}</td><td>${row.openingPrice ? row.openingPrice.toFixed(2) : '--'} ${row.closingPrice && row.closingPrice !== row.openingPrice ? `→ ${row.closingPrice.toFixed(2)}` : ''}</td><td>${row.resolved ? `${row.awayScore} - ${row.homeScore}` : '<span class="no-value">In progress</span>'}</td><td>${outcomePill(row)}</td></tr>`).join('')}</tbody></table></div>${rows.length > 200 ? `<p class="table-footnote">Showing the first 200 of ${rows.length} matching rows. Narrow your search to see more specific results.</p>` : ''}` : `<div class="empty-state">${icon('receipt-text')}<h3>No matching predictions</h3><p>Adjust your search or filter.</p></div>`;
+    return rows.length ? `<div class="table-container"><table class="signal-table"><thead><tr><th>Matchup</th><th>Selection</th><th>Pick prob.</th><th>Risk</th><th>Opening / closing odds</th><th>Result (away - home)</th><th>Outcome</th></tr></thead><tbody>${rows.slice(0, 200).map((row) => `<tr><td>${escapeHtml(row.sport?.toUpperCase())} · ${escapeHtml(row.awayTeam || '--')} @ ${escapeHtml(row.homeTeam || '--')}${renderGameTime(row, data)}<small class="cell-note">Event ${escapeHtml(row.eventId)} · logged ${escapeHtml(timestamp(row.loggedAt))}</small></td><td>${row.selection ? escapeHtml(row.selection === 'home' ? row.homeTeam || 'Home' : row.awayTeam || 'Away') : '<span class="no-value">--</span>'}</td><td>${percent(row.pickProbability)}</td><td>${riskTag(row)}</td><td>${row.openingPrice ? row.openingPrice.toFixed(2) : '--'} ${row.closingPrice && row.closingPrice !== row.openingPrice ? `→ ${row.closingPrice.toFixed(2)}` : ''}</td><td>${row.resolved ? `${row.awayScore} - ${row.homeScore}` : '<span class="no-value">In progress</span>'}</td><td>${outcomePill(row)}</td></tr>`).join('')}</tbody></table></div>${rows.length > 200 ? `<p class="table-footnote">Showing the first 200 of ${rows.length} matching rows. Narrow your search to see more specific results.</p>` : ''}` : `<div class="empty-state">${icon('receipt-text')}<h3>No matching predictions</h3><p>Adjust your search or filter.</p></div>`;
   }
 
   function renderAudit() {
@@ -177,8 +210,8 @@ export function createAuditWorkspace({ state, api, render, icons, toast }) {
     const button = event.target.closest('button');
     if (!button) return;
     if (button.dataset.strata) { ui.strata = button.dataset.strata; render(); }
-    if (button.dataset.calendarMonth) { ui.month = shiftMonth(ui.month, Number(button.dataset.calendarMonth)); render(); }
-    if (button.dataset.calendarDay) { ui.day = ui.day === button.dataset.calendarDay ? null : button.dataset.calendarDay; render(); }
+    if (button.dataset.calendarMonth) { ui.month = shiftMonth(ui.month, Number(button.dataset.calendarMonth)); ui.day = null; void load(true); }
+    if (button.dataset.calendarDay) { ui.day = button.dataset.calendarDay; render(); openDayDialog(ui.day); }
     if (button.hasAttribute('data-calendar-clear')) { ui.day = null; render(); }
     if (button.hasAttribute('data-audit-retry') || button.hasAttribute('data-audit-refresh')) void load(true);
     if (button.hasAttribute('data-audit-export')) { if (ui.data) { download(ui.data, `sportsstat-audit-${ui.sport}-${new Date().toISOString().slice(0, 10)}.json`); toast('Audit report exported.'); } }

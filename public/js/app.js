@@ -25,7 +25,7 @@ const state = {
 const historyCache = new Map();
 let toastTimer;
 const research = createResearchWorkspace({ state, api, render, openDialog, icons, toast, onWindowChange: recomputePredictions });
-const audit = createAuditWorkspace({ state, api, render, icons, toast });
+const audit = createAuditWorkspace({ state, api, render, icons, toast, openDialog });
 
 function biasFactor() { return state.calibration.get(state.sport)?.biasFactor || 0; }
 
