@@ -103,6 +103,23 @@ test('proxy validates parameters and hides its implementation header', async (co
   assert.ok(response.headers.get('content-security-policy'));
 });
 
+test('index points at per-deploy asset URLs so cached scripts can never be stale', async (context) => {
+  const server = createApp({}).listen(0, '127.0.0.1');
+  context.after(() => new Promise((resolve) => server.close(resolve)));
+  await new Promise((resolve) => server.once('listening', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const page = await fetch(`${base}/`);
+  assert.equal(page.headers.get('cache-control'), 'no-cache');
+  const html = await page.text();
+  const script = html.match(/src="(\/v\/[a-zA-Z0-9]+\/js\/app\.js)"/)?.[1];
+  assert.ok(script && /href="\/v\/[a-zA-Z0-9]+\/css\/styles\.css"/.test(html));
+  const asset = await fetch(`${base}${script}`);
+  assert.equal(asset.status, 200);
+  assert.match(asset.headers.get('cache-control'), /immutable/);
+  assert.equal((await fetch(`${base}${script.replace('app.js', 'audit.js')}`)).status, 200);
+  assert.equal((await fetch(`${base}/js/app.js`)).headers.get('cache-control'), 'no-cache');
+});
+
 test('cloud audit and raw export use durable records; storage outages are explicit 503 errors', async (context) => {
   let fail = false;
   const records = [

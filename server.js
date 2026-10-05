@@ -3,7 +3,7 @@ import helmet from 'helmet';
 import { rateLimit } from 'express-rate-limit';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import { createFeeds, SPORTS } from './src/feeds.js';
 import { createLedger } from './src/ledger.js';
 import { createTelegramNotifier } from './src/notifier.js';
@@ -16,6 +16,8 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 
 const OPTIMIZED_PARAMS_FILE = fileURLToPath(new URL('./data/optimized-params.json', import.meta.url));
 const LEDGER_FILE = fileURLToPath(new URL('./data/predictions.jsonl', import.meta.url));
+// Render sets RENDER_GIT_COMMIT; otherwise every server start is treated as a new build.
+const BUILD_ID = (process.env.RENDER_GIT_COMMIT || Date.now().toString(36)).replace(/[^a-zA-Z0-9]/g, '').slice(0, 12) || 'dev';
 
 // Reads the config file src/optimize.js writes (recency decay / SOS weight winners plus the
 // fractional Kelly grid search), regenerated periodically offline via `npm run optimize`. Read
@@ -157,7 +159,15 @@ export function createApp(feeds = createFeeds(), { historyStore = null, backgrou
     next();
   }, route((req) => feeds.markets(req.query.sport, req.query.event, req.query.market, Number(req.query.window || 10))));
   app.use('/api', (req, res) => res.status(404).json({ error: 'API endpoint not found.' }));
-  app.use(express.static(fileURLToPath(new URL('./public', import.meta.url)), { etag: true, maxAge: process.env.NODE_ENV === 'production' ? '1h' : 0 }));
+  // Each deploy gets new asset URLs (relative module imports inherit the prefix), so the CDN and
+  // browsers can never run a stale script; the HTML that points at them is always revalidated.
+  const publicDir = fileURLToPath(new URL('./public', import.meta.url));
+  const indexHtml = readFileSync(join(publicDir, 'index.html'), 'utf8')
+    .replace('src="/js/app.js"', `src="/v/${BUILD_ID}/js/app.js"`)
+    .replace('href="/css/styles.css"', `href="/v/${BUILD_ID}/css/styles.css"`);
+  app.get(['/', '/index.html'], (req, res) => res.set('Cache-Control', 'no-cache').type('html').send(indexHtml));
+  app.use('/v/:build', express.static(publicDir, { etag: true, immutable: true, maxAge: '365d', index: false }));
+  app.use(express.static(publicDir, { etag: true, maxAge: 0, setHeaders: (res) => res.set('Cache-Control', 'no-cache') }));
   app.use((error, req, res, next) => {
     if (['HISTORY_STORAGE_UNAVAILABLE', 'ODDS_STORAGE_UNAVAILABLE', 'ODDS_UNAVAILABLE'].includes(error.code)) return res.status(503).json({ error: error.message });
     // Client errors raised by middleware (malformed JSON, oversized body) keep their 4xx status and
