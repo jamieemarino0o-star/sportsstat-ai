@@ -53,6 +53,7 @@ export async function sendStartupTelegramTest({ token = process.env.TELEGRAM_BOT
 export function createApp(feeds = createFeeds(), { historyStore = null, backgroundJobs = null, jobToken = process.env.BACKGROUND_JOB_TOKEN || '' } = {}) {
   if (jobToken && jobToken.length < 32) throw new Error('BACKGROUND_JOB_TOKEN must contain at least 32 characters.');
   const app = express();
+  app.set('trust proxy', 1);
   app.disable('x-powered-by');
   // Behind a reverse proxy (e.g. Render), set TRUST_PROXY=1 so rate limiting keys on the real client
   // IP rather than lumping every visitor into the proxy's single bucket. Off by default: trusting
