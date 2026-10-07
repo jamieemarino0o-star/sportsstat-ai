@@ -34,9 +34,39 @@ function snapshotMoneyline(event, time) {
 
 const OVERDUE_SWEEP_INTERVAL = 15 * 60 * 1000;
 
-export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY, ledger = createLedger(), oddsCache = createOddsCache() } = {}) {
+export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KEY || process.env.THE_ODDS_API_KEY, ledger = createLedger(), oddsCache = createOddsCache(), cacheMaxBytes = 32 * 1024 * 1024, now = Date.now } = {}) {
+  if (!Number.isSafeInteger(cacheMaxBytes) || cacheMaxBytes < 1) throw new Error('Invalid feed cache byte limit');
   const ODDS_TTL = oddsCache.ttlMs;
   const cache = new Map();
+  let cacheBytes = 0;
+  let evictions = 0;
+  const removeCached = (key) => {
+    const entry = cache.get(key);
+    if (!entry) return;
+    cacheBytes -= entry.bytes;
+    cache.delete(key);
+    evictions += 1;
+  };
+  function pruneCache() {
+    for (const [key, entry] of cache) if (entry.expiresAt <= now()) removeCached(key);
+  }
+  function getCached(key) {
+    pruneCache();
+    const entry = cache.get(key);
+    if (!entry) return null;
+    cache.delete(key);
+    cache.set(key, entry);
+    return entry.result;
+  }
+  function setCached(key, result, ttl) {
+    pruneCache();
+    removeCached(key);
+    const bytes = Buffer.byteLength(JSON.stringify(result.data), 'utf8') * 4;
+    if (bytes > cacheMaxBytes || result.time + ttl <= now()) return;
+    while (cache.size && (cache.size >= 200 || cacheBytes + bytes > cacheMaxBytes)) removeCached(cache.keys().next().value);
+    cache.set(key, { result, bytes, expiresAt: result.time + ttl });
+    cacheBytes += bytes;
+  }
   const pending = new Map();
   const waiting = [];
   let active = 0;
@@ -68,9 +98,10 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
   }
 
   async function request(key, url, ttl, provider) {
-    const hit = cache.get(key);
-    if (hit && Date.now() - hit.time < ttl) return hit;
+    const hit = getCached(key);
+    if (hit) return hit;
     if (pending.has(key)) return pending.get(key);
+    if (active >= 5 && waiting.length >= 50) throw Object.assign(new Error('Feed busy. Please retry shortly.'), { status: 503, code: 'FEED_BUSY' });
     const task = (async () => {
       if (active >= 5) await new Promise((resolve) => waiting.push(resolve));
       else active += 1;
@@ -80,11 +111,10 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
           if (!response.ok) throw new Error(`${provider === 'espn' ? 'ESPN' : 'The Odds API'} returned HTTP ${response.status}`);
           const data = await response.json();
           const remaining = response.headers.get('x-requests-remaining');
-          return { data, time: Date.now(), remaining: remaining !== null && Number.isInteger(Number(remaining)) ? Number(remaining) : null };
+          return { data, time: now(), remaining: remaining !== null && Number.isInteger(Number(remaining)) ? Number(remaining) : null };
         };
         const result = provider === 'odds' ? await oddsCache.get(key, load) : await load();
-        cache.set(key, result);
-        if (cache.size > 400) cache.delete(cache.keys().next().value);
+        setCached(key, result, ttl);
         health[provider] = { state: 'connected', lastSuccess: new Date(result.time).toISOString(), message: 'Feed connected' };
         if (provider === 'odds') health.odds.remaining = result.remaining == null ? null : String(result.remaining);
         return result;
@@ -129,6 +159,10 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
   const source = (sport, resource, time) => ({ provider: 'ESPN', url: `https://site.api.espn.com/apis/site/v2/sports/${SPORTS[sport].path}/${resource}`, fetchedAt: new Date(time).toISOString() });
 
   const feeds = {
+    memoryStatus: () => {
+      pruneCache();
+      return { cacheEntries: cache.size, estimatedCacheBytes: cacheBytes, cacheMaxBytes, evictions, activeRequests: active, queuedRequests: waiting.length, pendingRequests: pending.size };
+    },
     status: () => ({ espn: { ...health.espn }, odds: { ...health.odds, budget: oddsCache.status() }, serverTime: new Date().toISOString() }),
     async scoreboard(sport) {
       const result = await espn(sport, 'scoreboard', 20000);
@@ -218,8 +252,8 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
     async markets(sport, eventId, marketKey, window = 10) {
       if (!oddsKey) return { configured: false, signals: [], message: 'Connect The Odds API to retrieve actual market lines.' };
       const cacheKey = `analysis:${sport}:${eventId}:${marketKey}:${window}`;
-      const hit = cache.get(cacheKey);
-      if (hit && Date.now() - hit.time < ODDS_TTL) return hit.data;
+      const hit = getCached(cacheKey);
+      if (hit) return hit.data;
       const board = await feeds.scoreboard(sport);
       const game = board.games.find((entry) => entry.id === eventId && !entry.completed);
       if (!game) return { configured: true, signals: [], message: 'This event is not on the current active scoreboard.' };
@@ -257,7 +291,7 @@ export function createFeeds({ fetcher = fetch, oddsKey = process.env.ODDS_API_KE
         }),
         quotes,
       };
-      cache.set(cacheKey, { time: prices.time, data: result });
+      setCached(cacheKey, { time: prices.time, data: result }, ODDS_TTL);
       return result;
     },
   };

@@ -169,7 +169,7 @@ export function createApp(feeds = createFeeds(), { historyStore = null, backgrou
   app.use('/v/:build', express.static(publicDir, { etag: true, immutable: true, maxAge: '365d', index: false }));
   app.use(express.static(publicDir, { etag: true, maxAge: 0, setHeaders: (res) => res.set('Cache-Control', 'no-cache') }));
   app.use((error, req, res, next) => {
-    if (['HISTORY_STORAGE_UNAVAILABLE', 'ODDS_STORAGE_UNAVAILABLE', 'ODDS_UNAVAILABLE'].includes(error.code)) return res.status(503).json({ error: error.message });
+    if (['HISTORY_STORAGE_UNAVAILABLE', 'ODDS_STORAGE_UNAVAILABLE', 'ODDS_UNAVAILABLE', 'FEED_BUSY'].includes(error.code)) return res.status(503).json({ error: error.message });
     // Client errors raised by middleware (malformed JSON, oversized body) keep their 4xx status and
     // get a generic message; everything else is an upstream failure whose message feeds.js has
     // already reduced to a safe, secret-free summary.
@@ -233,6 +233,14 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   runJobs();
   const scannerTimer = setInterval(runJobs, 600000);
   scannerTimer.unref();
+  const logMemory = () => {
+    const usage = process.memoryUsage();
+    const mib = (bytes) => Math.round(bytes / 1024 / 1024 * 10) / 10;
+    console.log('[memory]', JSON.stringify({ rssMiB: mib(usage.rss), heapUsedMiB: mib(usage.heapUsed), externalMiB: mib(usage.external), feeds: feeds.memoryStatus() }));
+  };
+  const memoryTimer = setInterval(logMemory, 300000);
+  memoryTimer.unref();
+  logMemory();
   const server = createApp(feeds, { historyStore, backgroundJobs }).listen(PORT, '0.0.0.0', () => {
     console.log(`SportsStat AI Predictor running on all interfaces at port ${PORT}`);
     console.log(`Prediction history: ${historyStore ? 'Supabase (durable)' : 'local file (not cloud-backed)'}`);
@@ -245,6 +253,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       clearInterval(notificationTimer);
       clearInterval(reconciliationTimer);
       clearInterval(scannerTimer);
+      clearInterval(memoryTimer);
       notifier.close();
       server.close(() => process.exit(0));
       server.closeAllConnections?.();

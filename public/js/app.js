@@ -261,6 +261,7 @@ function renderChrome() {
   $('#refresh-button').classList.toggle('spinning', state.loading);
   $('#refresh-button').disabled = state.loading;
   $('#export-button').disabled = state.view === 'audit' ? true : (state.view === 'bets' || research.advancedActive() ? !research.canExport() : !signals().some((item) => item.prediction?.probability != null));
+  $('.sport-tabs').hidden = state.view === 'audit';
   const notice = $('#notice');
   notice.hidden = !state.error && !state.partial;
   notice.innerHTML = state.error ? `${icon('triangle-alert')}${escapeHtml(state.error)}${state.loadedAt ? ` Last successful scoreboard: ${escapeHtml(time(state.loadedAt))}.` : ''}` : `${icon('info')}Some team history is unavailable. Signals use only the completed results received.`;

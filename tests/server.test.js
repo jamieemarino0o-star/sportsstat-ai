@@ -5,6 +5,46 @@ import { createFeeds } from '../src/feeds.js';
 import { createLedger } from '../src/ledger.js';
 import { createOddsCache } from '../src/odds-cache.js';
 
+test('feed cache bounds large responses, expires retained data and skips oversized entries', async () => {
+  let time = Date.now();
+  let calls = 0;
+  let size = 4000;
+  const feeds = createFeeds({ cacheMaxBytes: 40000, now: () => time, fetcher: async () => {
+    calls += 1;
+    return Response.json({ events: [], padding: 'x'.repeat(size) });
+  } });
+  for (let index = 1; index <= 30; index += 1) await feeds.history('nfl', String(index), 2026);
+  const stats = feeds.memoryStatus();
+  assert.ok(stats.estimatedCacheBytes <= stats.cacheMaxBytes);
+  assert.ok(stats.cacheEntries <= 2);
+  assert.ok(stats.evictions > 0);
+  await feeds.history('nfl', '30', 2026);
+  assert.equal(calls, 60);
+  time += 900001;
+  assert.equal(feeds.memoryStatus().cacheEntries, 0);
+  assert.equal(feeds.memoryStatus().estimatedCacheBytes, 0);
+  size = 20000;
+  await feeds.history('nfl', '31', 2026);
+  assert.equal(feeds.memoryStatus().cacheEntries, 0);
+});
+
+test('feed request queue rejects excess unique work while coalescing duplicates', async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let calls = 0;
+  const feeds = createFeeds({ fetcher: async () => { calls += 1; await gate; return Response.json({}); } });
+  const jobs = Array.from({ length: 55 }, (_, index) => feeds.summary('nfl', String(index + 1)));
+  const duplicate = feeds.summary('nfl', '1');
+  try {
+    assert.equal(feeds.memoryStatus().activeRequests, 5);
+    assert.equal(feeds.memoryStatus().queuedRequests, 50);
+    await assert.rejects(feeds.summary('nfl', '999'), { code: 'FEED_BUSY' });
+  } finally { release(); }
+  await Promise.all([...jobs, duplicate]);
+  assert.equal(calls, 55);
+  assert.equal(feeds.memoryStatus().pendingRequests, 0);
+});
+
 test('odds polling coalesces calls and enforces a shared budget without blocking ESPN', async () => {
   let paidCalls = 0;
   const feeds = createFeeds({ oddsKey: 'fixture-key', oddsCache: createOddsCache({ budgetLimit: 1 }), fetcher: async (url) => {
