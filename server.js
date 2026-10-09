@@ -214,7 +214,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
     catch (error) { console.error(`[telegram] ledger recovery failed (${error.code || error.name})`); }
     finally { syncingNotifications = false; }
   };
-  const notificationTimer = setInterval(() => { void syncNotifications(); }, 30000);
+  const notificationTimer = setInterval(() => { void syncNotifications(); }, 300000);
   notificationTimer.unref();
   let jobRun = null;
   const backgroundJobs = {
